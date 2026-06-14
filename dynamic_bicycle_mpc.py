@@ -52,15 +52,20 @@ def vehicle_dynamics(X, u, p):
     vxs = vx if abs(vx) > p.v_min else (p.v_min if vx >= 0 else -p.v_min)
     alpha_f = delta - (vy + p.lf * r) / vxs
     alpha_r = -(vy - p.lr * r) / vxs
+    am = getattr(p, "alpha_max", 0.12)        # tire grip limit (slip saturation)
+    alpha_f = max(-am, min(am, alpha_f))
+    alpha_r = max(-am, min(am, alpha_r))
     Fyf = p.Cf * alpha_f
     Fyr = p.Cr * alpha_r
+    vb = getattr(p, "v_blend", 2.0)           # fade lateral dynamics below this
+    fade = min(1.0, abs(vx) / vb)             # 0 at standstill, 1 above v_blend
     return np.array([
         vx * np.cos(psi) - vy * np.sin(psi),
         vx * np.sin(psi) + vy * np.cos(psi),
         r,
         a + vy * r,
-        (Fyf + Fyr) / p.m - vx * r,
-        (p.lf * Fyf - p.lr * Fyr) / p.Iz,
+        fade * ((Fyf + Fyr) / p.m - vx * r),
+        fade * ((p.lf * Fyf - p.lr * Fyr) / p.Iz),
     ])
 
 
@@ -87,6 +92,8 @@ class CarParams:
         self.Cf = 120000.0   # front axle cornering stiffness [N/rad]
         self.Cr = 120000.0   # rear axle cornering stiffness [N/rad]
         self.v_min = 1.0     # floor on vx used in the tire model [m/s]
+        self.alpha_max = 0.12  # slip-angle saturation [rad] (~7 deg grip limit)
+        self.v_blend = 2.0     # below this speed, lateral dynamics fade out [m/s]
 
     @property
     def wheelbase(self):
@@ -115,6 +122,8 @@ class DynamicBicycleMPC:
         input_rate_cost: tuple[float, ...] = (1, 60),
         safety_margin: float = 0.5,
         slack_penalty: float = 1e5,
+        road_halfwidth: float = 5.0,   # drivable half-width for the pass decision
+        pass_zone: float = 6.0,        # how far along the road the keep-out spans
     ) -> None:
         self.p = params or CarParams()
         self.dt = dt
@@ -126,6 +135,9 @@ class DynamicBicycleMPC:
         self.max_d_acc = max_d_acc
         self.max_steer = max_steer
         self.max_d_steer = max_d_steer
+        self._road_halfwidth = road_halfwidth
+        self._pass_zone = pass_zone
+        self._last_obstacle_action = "none"
 
         self.q = np.diag(state_cost)
         self.qf = np.diag(final_state_cost)
@@ -301,13 +313,47 @@ class DynamicBicycleMPC:
             else np.zeros(self.CONTROL_DIM)
         )
 
-        x_ref, y_ref = target[0], target[1]
-        vx_ref, psi_ref = target[2], target[3]
+        x_ref, y_ref = np.array(target[0], float), np.array(target[1], float)
+        vx_ref, psi_ref = np.array(target[2], float), target[3]
+
+        # ---- obstacle decision (done BEFORE building the reference) ----
+        self._last_obstacle_action = "none"
+        decision = None
+        if obstacle is not None:
+            ox, oy, orad, ovx, ovy = obstacle
+            keep = orad + self._vehicle_buffer
+            dref = np.hypot(x_ref - ox, y_ref - oy)
+            kstar = int(np.argmin(dref))
+            ths = psi_ref[kstar]
+            txs, tys = np.cos(ths), np.sin(ths)
+            lxs, lys = -np.sin(ths), np.cos(ths)
+            lateral_obs = (ox - x_ref[kstar]) * lxs + (oy - y_ref[kstar]) * lys
+            room_left = self._road_halfwidth - (lateral_obs + keep)
+            room_right = self._road_halfwidth + (lateral_obs - keep)
+            can_pass = max(room_left, room_right) >= 0.0
+            pass_left = room_left >= room_right
+            decision = dict(ox=ox, oy=oy, orad=orad, ovx=ovx, ovy=ovy, keep=keep,
+                            txs=txs, tys=tys, can_pass=can_pass, pass_left=pass_left)
+            self._last_obstacle_action = (
+                ("pass_left" if pass_left else "pass_right") if can_pass else "stop")
+
+            if not can_pass:
+                # Stop: clamp the position reference to a stop line behind the
+                # obstacle and zero the speed target, so the controller brakes
+                # to a halt instead of fighting a forward-pulling reference.
+                stop_x = ox - txs * keep
+                stop_y = oy - tys * keep
+                for k in range(len(x_ref)):
+                    s_k = (x_ref[k] - ox) * txs + (y_ref[k] - oy) * tys
+                    if s_k > -keep:                 # at/after the stop line
+                        x_ref[k], y_ref[k] = stop_x, stop_y
+                vx_ref = np.zeros_like(vx_ref)       # target speed 0 -> stop
+
         cos_v, sin_v = np.cos(psi_ref), np.sin(psi_ref)
         along_ref = cos_v * x_ref + sin_v * y_ref
         cross_ref = -sin_v * x_ref + cos_v * y_ref
 
-        # reference params (depend only on the path) -> set once
+        # reference params -> set once
         for k in range(N + 1):
             c, s = cos_v[k], sin_v[k]
             M = np.zeros((n, n))
@@ -322,30 +368,38 @@ class DynamicBicycleMPC:
                 [along_ref[k], cross_ref[k], vx_ref[k], psi_ref[k], 0.0, 0.0]
             )
 
-        if obstacle is not None:
-            ox, oy, orad, ovx, ovy = obstacle
-        else:
-            ox = oy = orad = ovx = ovy = None
-
         obs_n = np.zeros((N, n))
         obs_safe = np.zeros(N)
-        for k in range(N):
-            if obstacle is None:
-                obs_n[k, 0] = 1.0
-                obs_safe[k] = -1e6
-            else:
-                # Half-plane tangent to the keep-out disc, oriented from the
-                # obstacle toward the reference path. This points longitudinally
-                # when the car is still approaching and rotates to lateral as it
-                # comes alongside, giving a smooth avoidance bulge. (Assumes the
-                # obstacle is offset from the centreline; an obstacle dead-centre
-                # on the path needs the lane-change variant -- see README.)
-                dx = x_ref[k + 1] - ox
-                dy = y_ref[k + 1] - oy
-                d = max(np.hypot(dx, dy), 1e-3)
-                nx, ny = dx / d, dy / d
-                obs_n[k, 0], obs_n[k, 1] = nx, ny
-                obs_safe[k] = nx * ox + ny * oy + orad + self._vehicle_buffer
+        if decision is None:
+            obs_n[:, 0] = 1.0
+            obs_safe[:] = -1e6
+        else:
+            ox, oy = decision["ox"], decision["oy"]
+            ovx, ovy, keep = decision["ovx"], decision["ovy"], decision["keep"]
+            can_pass, pass_left = decision["can_pass"], decision["pass_left"]
+            activation = decision["orad"] + self._pass_zone
+            for k in range(N):
+                oxk = ox + ovx * k * self.dt
+                oyk = oy + ovy * k * self.dt
+                thk = psi_ref[k + 1]
+                txk, tyk = np.cos(thk), np.sin(thk)        # road tangent
+                lxk, lyk = -np.sin(thk), np.cos(thk)       # left normal
+                if not can_pass:
+                    # stay behind: t.pos <= t.obs - keep  (brakes to a stop)
+                    obs_n[k, 0], obs_n[k, 1] = -txk, -tyk
+                    obs_safe[k] = -(txk * oxk + tyk * oyk) + keep
+                    continue
+                s_gap = (x_ref[k + 1] - oxk) * txk + (y_ref[k + 1] - oyk) * tyk
+                if abs(s_gap) < activation:               # alongside -> push aside
+                    if pass_left:
+                        obs_n[k, 0], obs_n[k, 1] = lxk, lyk
+                        obs_safe[k] = lxk * oxk + lyk * oyk + keep
+                    else:
+                        obs_n[k, 0], obs_n[k, 1] = -lxk, -lyk
+                        obs_safe[k] = -(lxk * oxk + lyk * oyk) + keep
+                else:                                     # clear -> inactive
+                    obs_n[k, 0] = 1.0
+                    obs_safe[k] = -1e6
         for k in range(N):
             self._obs_n[k].value = obs_n[k]
         self._obs_safe.value = obs_safe
