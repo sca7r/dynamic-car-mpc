@@ -32,8 +32,9 @@ START_SPEED = 11.0     # car's initial speed [m/s]
 #  degenerate case (see README).
 # ====================================================================== #
 OBSTACLES = [
-    {"along": 0.13, "offset": 3.0, "radius": 2.5},   # stalled car in the lane
-    # {"along": 0.55, "offset": -3.0, "radius": 2.0},  # add a second one
+    {"along": 0.13, "offset":  1.8, "radius": 2.5},   # obstacle 1 – early straight, left
+    {"along": 0.40, "offset": -2.0, "radius": 2.0},   # obstacle 2 – mid circuit, right
+    {"along": 0.70, "offset":  2.5, "radius": 2.0},   # obstacle 3 – late circuit, left
 ]
 
 # ====================================================================== #
@@ -49,7 +50,23 @@ SENSOR_FOV_DEG = 100.0   # degrees (total cone)
 #    Cf : front cornering stiffness [N/rad]   Cr : rear [N/rad]
 #  e.g. lowering Cr relative to Cf makes the car more oversteery.
 # ====================================================================== #
-CAR = dict(m=1500.0, Iz=2250.0, lf=1.2, lr=1.6, Cf=120000.0, Cr=120000.0)
+# Tesla Model 3 (approx): ~1845 kg, wheelbase 2.875 m, near 50/50 split, stiff tires.
+# Both the MPC's prediction model AND our own simulator read this one dict, so
+# they always stay matched (a mismatch is what makes the car drift off-road).
+CAR = dict(m=1845.0, Iz=2600.0, lf=1.44, lr=1.44, Cf=140000.0, Cr=160000.0)
+
+# ====================================================================== #
+#  OBSTACLE AVOIDANCE ROBUSTNESS
+#  ROAD_HALFWIDTH = drivable half-width [m] used to decide whether there is
+#  room to overtake an obstacle sitting in the lane:
+#    * a side has room  -> car LANE-CHANGES around the obstacle
+#    * no room either side -> car STOPS behind it (brakes to a halt)
+#  Bigger = more willing to swerve wide; smaller = more likely to stop.
+#  (A CARLA town lane is ~3.5 m; ~5 m lets the car borrow the next lane.)
+#  PASS_ZONE = how far along the road the keep-out extends past the obstacle [m].
+# ====================================================================== #
+ROAD_HALFWIDTH = 5.0
+PASS_ZONE = 6.0
 
 # ====================================================================== #
 #  CONTROLLER / SIM timing
