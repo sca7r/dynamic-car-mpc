@@ -68,6 +68,22 @@ CAR = dict(m=1845.0, Iz=2600.0, lf=1.44, lr=1.44, Cf=140000.0, Cr=160000.0)
 ROAD_HALFWIDTH = 5.0
 PASS_ZONE = 6.0
 
+# Minimum clearance the MPC keeps between the car body and any obstacle surface.
+# Increase this if the car passes too close; decrease if it swerves too wide.
+OBSTACLE_SAFETY_MARGIN = 0.8   # metres — clearance from obstacle surface
+                                # (was 1.5 but that made keep-out too large for
+                                #  CARLA town lanes; 0.8 gives ~1.8 m real clearance)
+
+# ====================================================================== #
+#  CARLA BRIDGE SETTINGS  (used by carla_mpc.py only)
+# ====================================================================== #
+CARLA_TARGET_SPEED     = 7.0   # m/s  — town driving speed (~25 km/h)
+CARLA_MAX_THROTTLE_ACC = 4.0   # m/s² that maps to throttle = 1.0
+CARLA_MAX_BRAKE_DEC    = 6.0   # m/s² that maps to brake = 1.0
+CARLA_OBSTACLE_RADIUS  = 1.5   # m    — radius assigned to detected CARLA vehicles
+                                # Real cars are ~1 m half-width; 1.5 adds a small buffer
+                                # without over-inflating the keep-out zone
+
 # ====================================================================== #
 #  CONTROLLER / SIM timing
 # ====================================================================== #

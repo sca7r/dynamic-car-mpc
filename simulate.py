@@ -27,6 +27,7 @@ import config as C
 from dynamic_bicycle_mpc import (
     DynamicBicycleMPC, CarParams, rk4_step,
     compute_path_from_wp, get_ref_trajectory, ego_to_global, _nn_idx,
+    AdaptiveSpeed,
 )
 
 
@@ -79,7 +80,9 @@ def main():
     p = CarParams()
     for k, v in C.CAR.items():
         setattr(p, k, v)
-    mpc = DynamicBicycleMPC(params=p, dt=C.DT, horizon_time=C.HORIZON_TIME)
+    mpc = DynamicBicycleMPC(params=p, dt=C.DT, horizon_time=C.HORIZON_TIME,
+                            safety_margin=getattr(C, "OBSTACLE_SAFETY_MARGIN", 1.5))
+    speed_ctrl = AdaptiveSpeed(base_speed=C.TARGET_SPEED)
 
     state = np.array([path[0, 0], path[1, 0], path[2, 0], C.START_SPEED, 0.0, 0.0])
     hist, plans, tele = [state.copy()], [None], []
@@ -90,9 +93,10 @@ def main():
             print("Simulation diverged."); break
         if i > 20 and np.hypot(state[0] - path[0, -1], state[1] - path[1, -1]) < 3.0:
             break
-        target = get_ref_trajectory(state, path, C.TARGET_SPEED,
-                                    mpc.control_horizon * C.DT, C.DT)
         ego_obs = sense(state, obstacles)
+        adaptive_v = speed_ctrl.update(state, path, ego_obs, C.DT)
+        target = get_ref_trajectory(state, path, adaptive_v,
+                                    mpc.control_horizon * C.DT, C.DT)
         ego_state = np.array([0.0, 0.0, 0.0, state[3], state[4], state[5]])
         traj_ego, u = mpc.solve(ego_state, target, obstacle=ego_obs, max_iter=3)
         if traj_ego is None:

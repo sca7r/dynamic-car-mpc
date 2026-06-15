@@ -36,6 +36,7 @@ brake, and the DPP problem structure are all identical.
 
 from __future__ import annotations
 
+import math
 import numpy as np
 import numpy.typing as npt
 import cvxpy as opt
@@ -138,6 +139,7 @@ class DynamicBicycleMPC:
         self._road_halfwidth = road_halfwidth
         self._pass_zone = pass_zone
         self._last_obstacle_action = "none"
+        self._obs_side_lock = None    # committed pass side; held until obstacle clears
 
         self.q = np.diag(state_cost)
         self.qf = np.diag(final_state_cost)
@@ -319,7 +321,9 @@ class DynamicBicycleMPC:
         # ---- obstacle decision (done BEFORE building the reference) ----
         self._last_obstacle_action = "none"
         decision = None
-        if obstacle is not None:
+        if obstacle is None:
+            self._obs_side_lock = None   # obstacle gone — release commitment
+        else:
             ox, oy, orad, ovx, ovy = obstacle
             keep = orad + self._vehicle_buffer
             dref = np.hypot(x_ref - ox, y_ref - oy)
@@ -331,7 +335,19 @@ class DynamicBicycleMPC:
             room_left = self._road_halfwidth - (lateral_obs + keep)
             room_right = self._road_halfwidth + (lateral_obs - keep)
             can_pass = max(room_left, room_right) >= 0.0
-            pass_left = room_left >= room_right
+
+            if not can_pass:
+                # No room — stop; also clear any stale lock
+                pass_left = False
+                self._obs_side_lock = None
+            else:
+                # Commitment: once a side is chosen, keep it until the obstacle
+                # leaves the sensor cone. Without this the pass-side can flip as
+                # the car swings off-centre, causing the oscillation / spinning.
+                if self._obs_side_lock is None:
+                    self._obs_side_lock = "pass_left" if (room_left >= room_right) else "pass_right"
+                pass_left = (self._obs_side_lock == "pass_left")
+
             decision = dict(ox=ox, oy=oy, orad=orad, ovx=ovx, ovy=ovy, keep=keep,
                             txs=txs, tys=tys, can_pass=can_pass, pass_left=pass_left)
             self._last_obstacle_action = (
@@ -518,3 +534,95 @@ def ego_to_global(state, traj_ego):
     g[0] += state[0]
     g[1] += state[1]
     return g
+
+
+class AdaptiveSpeed:
+    """
+    Gives the MPC human-like speed behaviour by modulating the target speed
+    reference based on what a driver would naturally do:
+
+      1. OBSTACLE APPROACH  — smooth deceleration as an obstacle enters sensor
+         range, proportional to proximity. Braking starts at obs_brake_start
+         metres and reaches v_min at obs_brake_end metres.
+
+      2. CORNER SLOWDOWN — looks ahead lookahead_s metres along the path,
+         finds the tightest curvature, and sets a speed limit so lateral
+         acceleration stays within a_lat_comfort. Speed rises automatically on
+         straights and drops into corners, exactly like a driver reading ahead.
+
+      3. SMOOTH TRANSITIONS — a first-order low-pass filter (time-constant tau)
+         prevents sudden speed jumps; the car accelerates and brakes gradually.
+
+    Usage (replaces constant target_v in the main loop):
+        speed_ctrl = AdaptiveSpeed(base_speed=target_v)
+        adaptive_v = speed_ctrl.update(state, path, ego_obs, dt=C.DT)
+        tgt = get_ref_trajectory(state, path, adaptive_v, ...)
+    """
+
+    def __init__(
+        self,
+        base_speed:      float = 11.0,
+        a_lat_comfort:   float =  4.5,   # m/s^2 comfortable lateral accel
+        lookahead_s:     float = 25.0,   # metres to scan ahead for corners
+        obs_brake_start: float = 35.0,   # metres: start braking for obstacle
+        obs_brake_end:   float =  5.0,   # metres: v_min reached here
+        v_min:           float =  4.0,   # m/s: ~14 km/h — keeps 12 m of MPC horizon
+        tau:             float =  1.2,   # s: smoothing time constant
+    ):
+        self.base            = base_speed
+        self.a_lat           = a_lat_comfort
+        self.lookahead       = lookahead_s
+        self.obs_brake_start = obs_brake_start
+        self.obs_brake_end   = obs_brake_end
+        self.v_min           = v_min
+        self.tau             = tau
+        self._v_smooth       = base_speed
+        self.reason          = "FREE"   # for HUD display
+
+    def update(self, state, path, obstacle_ego, dt: float) -> float:
+        """Call once per control tick. Returns adaptive target speed [m/s]."""
+        v_target = self.base
+        reasons  = []
+
+        # 1. obstacle proximity
+        if obstacle_ego is not None:
+            d = math.hypot(float(obstacle_ego[0]), float(obstacle_ego[1])) \
+                - float(obstacle_ego[2])
+            d = max(d, 0.)
+            if d < self.obs_brake_start:
+                t = max(0., (d - self.obs_brake_end)
+                           / (self.obs_brake_start - self.obs_brake_end))
+                v_obs = self.v_min + (self.base - self.v_min) * t
+                if v_obs < v_target:
+                    v_target = v_obs
+                    reasons.append("OBS")
+
+        # 2. path curvature ahead
+        i0 = _nn_idx(state[:3], path)
+        s, i, n, kmax = 0., i0, path.shape[1], 0.
+        while s < self.lookahead and i < n - 2:
+            dx = path[0,i+1]-path[0,i]; dy = path[1,i+1]-path[1,i]
+            ds = math.hypot(dx, dy)
+            dth = abs((path[2,i+1]-path[2,i]+math.pi) % (2*math.pi) - math.pi)
+            if ds > 1e-6:
+                kmax = max(kmax, dth/ds)
+            s += ds; i += 1
+
+        if kmax > 1e-4:
+            v_corner = max(math.sqrt(self.a_lat / kmax), self.v_min)
+            if v_corner < v_target:
+                v_target = v_corner
+                reasons.append("CORNER")
+
+        # 3. smooth low-pass
+        alpha = dt / (self.tau + dt)
+        self._v_smooth += alpha * (v_target - self._v_smooth)
+        self.reason = "+".join(reasons) if reasons else "FREE"
+        return max(self.v_min, self._v_smooth)
+
+    def reset(self, speed: float = None):
+        self._v_smooth = speed if speed is not None else self.base
+        self.reason = "FREE"
+
+    def set_base(self, speed: float):
+        self.base = speed
