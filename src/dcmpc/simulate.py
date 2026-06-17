@@ -23,11 +23,11 @@ if "--live" not in sys.argv:
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 
-import config as C
-from dynamic_bicycle_mpc import (
+from dcmpc import config as C
+from dcmpc.controller import (
     DynamicBicycleMPC, CarParams, rk4_step,
     compute_path_from_wp, get_ref_trajectory, ego_to_global, _nn_idx,
-    AdaptiveSpeed,
+    AdaptiveSpeed, build_mpc, build_adaptive_speed,
 )
 
 
@@ -77,12 +77,8 @@ def sense(state, obstacles):
 def main():
     path = compute_path_from_wp(C.TRACK_X, C.TRACK_Y, step=0.25)
     obstacles = resolve_obstacles(path)
-    p = CarParams()
-    for k, v in C.CAR.items():
-        setattr(p, k, v)
-    mpc = DynamicBicycleMPC(params=p, dt=C.DT, horizon_time=C.HORIZON_TIME,
-                            safety_margin=getattr(C, "OBSTACLE_SAFETY_MARGIN", 1.5))
-    speed_ctrl = AdaptiveSpeed(base_speed=C.TARGET_SPEED)
+    mpc = build_mpc(C)
+    speed_ctrl = build_adaptive_speed(C)
 
     state = np.array([path[0, 0], path[1, 0], path[2, 0], C.START_SPEED, 0.0, 0.0])
     hist, plans, tele = [state.copy()], [None], []
@@ -98,7 +94,7 @@ def main():
         target = get_ref_trajectory(state, path, adaptive_v,
                                     mpc.control_horizon * C.DT, C.DT)
         ego_state = np.array([0.0, 0.0, 0.0, state[3], state[4], state[5]])
-        traj_ego, u = mpc.solve(ego_state, target, obstacle=ego_obs, max_iter=3)
+        traj_ego, u = mpc.solve(ego_state, target, obstacle=ego_obs, max_iter=getattr(C, "MPC_MAX_ITER", 3))
         if traj_ego is None:
             brakes += 1
         plans.append(ego_to_global(state, traj_ego) if traj_ego is not None else None)

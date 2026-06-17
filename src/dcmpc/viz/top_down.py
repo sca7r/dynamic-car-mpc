@@ -1,5 +1,5 @@
 """
-Interactive top-down visualizer — motorsport telemetry aesthetic.
+Interactive top-down visualizer - motorsport telemetry aesthetic.
 
 Modes (TAB to toggle):
   AUTO    MPC drives, draws its live plan and sensor FOV cone
@@ -12,10 +12,11 @@ from __future__ import annotations
 import os, sys, math, time, collections
 import numpy as np
 
-import config as C
-from dynamic_bicycle_mpc import (
+from dcmpc import config as C
+from dcmpc.controller import (
     DynamicBicycleMPC, CarParams, rk4_step,
     compute_path_from_wp, get_ref_trajectory, ego_to_global,
+    build_mpc, build_adaptive_speed,
 )
 
 SELFTEST = "--selftest" in sys.argv
@@ -37,7 +38,7 @@ C_TARMAC    = ( 38,  40,  46)
 C_KERB_W    = (230, 230, 230)
 C_KERB_R    = (200,  40,  40)
 C_DASH_W    = (200, 200, 200)
-C_PLAN      = ( 57, 255, 180)   # neon green  – MPC horizon
+C_PLAN      = ( 57, 255, 180)   # neon green  - MPC horizon
 C_FOV       = ( 57, 200, 255, 35)  # sensor cone (RGBA)
 C_CAR_BODY  = ( 10, 120, 220)   # team blue
 C_CAR_ROOF  = ( 30, 170, 255)
@@ -47,7 +48,7 @@ C_OBS       = (220,  55,  55)
 C_OBS_GLOW  = (255, 100,  80, 80)
 C_HUD_BG    = ( 18,  20,  25, 210)
 C_HUD_LINE  = ( 40,  44,  52)
-C_ACCENT    = ( 57, 255, 180)   # same as plan – consistent accent
+C_ACCENT    = ( 57, 255, 180)   # same as plan - consistent accent
 C_WHITE     = (235, 238, 242)
 C_DIM       = (110, 115, 125)
 C_RED       = (255,  65,  65)
@@ -306,7 +307,7 @@ def draw_hud(surf, state, ucmd, mode, target_v, lap_t, best_lap, laps, fonts):
     badge.fill((*badge_col, 40))
     surf.blit(badge, (10, y))
     pygame.draw.rect(surf, badge_col, (10, y, HUD_W-20, 34), 2, border_radius=4)
-    ms = fB.render(f"{'● AUTO – MPC' if mode=='AUTO' else '◆ MANUAL – YOU'}", True, badge_col)
+    ms = fB.render(f"{'● AUTO - MPC' if mode=='AUTO' else '◆ MANUAL - YOU'}", True, badge_col)
     surf.blit(ms, (18, y+5)); y += 44
 
     sep()
@@ -422,7 +423,7 @@ def main():
     pygame.display.init()
     pygame.font.init()
     screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Dynamic-bicycle car MPC  —  motorsport view")
+    pygame.display.set_caption("Dynamic-bicycle car MPC  -  motorsport view")
     clock = pygame.time.Clock()
 
     fB = pygame.font.SysFont("consolas,menlo,monospace", 26, bold=True)
@@ -435,7 +436,7 @@ def main():
     p = CarParams()
     for k, v in C.CAR.items():
         setattr(p, k, v)
-    mpc = DynamicBicycleMPC(params=p, dt=C.DT, horizon_time=C.HORIZON_TIME)
+    mpc = build_mpc(C)
 
     def fresh():
         return np.array([path[0,0], path[1,0], path[2,0], target_v, 0., 0.])
@@ -478,7 +479,7 @@ def main():
                                      mpc.control_horizon*C.DT, C.DT)
             ego_obs = sense(state, obstacles)
             es = np.array([0.,0.,0., state[3], state[4], state[5]])
-            traj, u = mpc.solve(es, tgt, obstacle=ego_obs, max_iter=3)
+            traj, u = mpc.solve(es, tgt, obstacle=ego_obs, max_iter=getattr(C, "MPC_MAX_ITER", 3))
             plan_xy = ego_to_global(state, traj) if traj is not None else None
             ucmd = u[:,0]
             state = rk4_step(state, ucmd, C.DT, p, substeps=5)

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dcmpc"
+version = "1.0.0"
+description = "Real-time iterative MPC for a dynamic-bicycle car model, with pygame and CARLA front-ends."
+readme = "README.md"
+requires-python = ">=3.7"
+license = { text = "MIT" }
+authors = [{ name = "Your Name" }]
+keywords = ["mpc", "model-predictive-control", "autonomous-driving",
+            "vehicle-dynamics", "carla", "control-systems", "robotics"]
+
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "cvxpy>=1.1",
+    "osqp",
+    "matplotlib>=3.4",
+]
+
+[project.optional-dependencies]
+viz = ["pygame>=2.5"]
+# 3D semantic LiDAR window. Open3D gives the dense, mouse-orbitable view; the
+# viewer falls back to matplotlib-3D if Open3D isn't installed.
+gui = ["open3d", "PyQt5"]
+# CARLA itself is installed separately to match your simulator build:
+#   pip install carla==<your server version>
+carla = ["pygame>=2.5", "PyQt5"]
+dev = ["pytest>=7", "ruff"]
+
+[project.scripts]
+dcmpc-sim    = "dcmpc.simulate:main"
+dcmpc-manual = "dcmpc.manual_drive:main"
+dcmpc-drive  = "dcmpc.viz.drive:main"
+dcmpc-top    = "dcmpc.viz.top_down:main"
+dcmpc-3d     = "dcmpc.viz.chase_3d:main"
+dcmpc-carla  = "dcmpc.carla_bridge:main"
+dcmpc-plot   = "dcmpc.plot_trace:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100

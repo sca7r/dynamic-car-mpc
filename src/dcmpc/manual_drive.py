@@ -21,8 +21,8 @@ if "--live" not in sys.argv:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-import config as C
-from dynamic_bicycle_mpc import CarParams, rk4_step
+from dcmpc import config as C
+from dcmpc.controller import CarParams, rk4_step
 
 # ====================================================================== #
 #  YOUR INPUTS  -- (duration [s], accel [m/s^2], steer [rad])

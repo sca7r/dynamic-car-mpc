@@ -1,117 +1,215 @@
-# Dynamic-Bicycle Car MPC
+# dcmpc - Dynamic-Bicycle Car MPC
 
-A real-time **iterative Model Predictive Controller** for an autonomous car,
-built on the **dynamic single-track (bicycle) model with a linear tire model** —
-the same class of model used in professional autonomous-driving and motorsport
-stacks. The car tracks a 600 m circuit at cruise speed, avoids stalled obstacles,
-and adapts its speed to corners and hazards the way a human driver would.
+A real-time **iterative Model Predictive Controller (MPC)** for an autonomous
+car, built on the **dynamic single-track ("bicycle") model with a linear tire
+model** - the same class of model used in professional autonomous-driving and
+motorsport stacks. It tracks a reference path, slows for corners and obstacles
+the way a human driver does, avoids multiple obstacles via soft half-plane
+constraints, and runs both in a custom pygame visualizer and on CARLA with a
+virtual-LiDAR perception front-end.
 
 ![demo](demo.gif)
 
 ---
 
-## Quick start
+## Table of contents
 
-```bash
-pip install -r requirements.txt   # cvxpy, numpy, scipy, matplotlib, osqp
-python simulate.py                # run the sim, save result.png + demo.gif
-python simulate.py --no-gif       # skip the gif (much faster)
-```
-
-For a live interactive window:
-
-```bash
-pip install pygame
-python drive.py                   # recommended entry point (3D + top-down)
-```
+1. [Quick start (step by step)](#quick-start-step-by-step)
+2. [What each command does](#what-each-command-does)
+3. [Debugging the LiDAR](#debugging-the-lidar)
+4. [Package layout](#package-layout)
+5. [The maths, and why the car behaves the way it does](#the-maths-and-why-the-car-behaves-the-way-it-does)
+6. [Configuring the scenario](#configuring-the-scenario)
+7. [Extensions](#extensions)
 
 ---
 
-## Project structure
+## Quick start (step by step)
 
-```
-├── config.py              ← Edit this to change the road, car, obstacles, speed
-├── dynamic_bicycle_mpc.py ← Controller, vehicle model, path helpers, AdaptiveSpeed
-├── simulate.py            ← Headless closed-loop sim → result.png, demo.gif
-├── drive.py               ← Live pygame viewer: 3D chase + top-down (V to switch)
-├── drive_pygame.py        ← Standalone top-down viewer
-├── drive_pygame_3d.py     ← Standalone 3D chase-camera viewer
-├── manual_drive.py        ← Open-loop: give your own throttle/steer inputs
-├── carla_mpc.py           ← CARLA bridge (real physics engine, Town10)
-├── plot_trace.py          ← Plot a carla_trace_*.csv produced by carla_mpc.py
-├── requirements.txt
-└── README.md
-```
-
-**The only file you need to edit is `config.py`.** Everything else reads from it.
-
----
-
-## Live viewer (`drive.py`)
+**1. Get the code and a clean Python environment.**
 
 ```bash
-python drive.py
+git clone <your-repo> dcmpc
+cd dcmpc
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 ```
 
-Press **V** to cycle layouts:
+**2. Install the package (editable, so edits take effect immediately).**
 
-| Layout | What you see |
-|--------|-------------|
-| SPLIT  | 3D chase camera (left) + top-down map (right) |
-| 3D     | Full-window 3D chase camera |
-| TOP    | Full-window top-down with full telemetry HUD |
+```bash
+pip install -e ".[viz]"            # core solver + pygame viewers
+```
 
-Press **TAB** to toggle driving mode:
+That single command pulls in NumPy, SciPy, CVXPY, OSQP, Matplotlib and pygame,
+and registers the `dcmpc-*` commands on your PATH.
 
-| Mode   | Who drives |
-|--------|-----------|
-| AUTO   | The MPC drives, adapts speed, avoids obstacles |
-| MANUAL | You drive — arrow keys (feel the dynamic tire model) |
+**3. Run the headless simulation first - no GPU, no CARLA, ~10 seconds.**
 
-Other keys: `+` / `-` adjust cruise speed · `R` reset · `ESC` quit.
+```bash
+dcmpc-sim --no-gif
+```
 
-The HUD shows speed (with a target-speed marker on the bar), steering angle,
-yaw rate, sideslip, lateral-g, a G-force circle, lap times, and — in AUTO mode
-— an `ADAPT` row showing the adaptive speed and reason (`FREE` / `CORNER` / `OBS`).
+You'll get `result.png` (the driven line around the track) and `telemetry.png`
+(speed / steering / sideslip / lateral-g). This is the fastest way to confirm
+the controller works on your machine.
+
+**4. Watch it drive live.**
+
+```bash
+dcmpc-drive
+```
+
+Controls: **V** switches view (split / 3D / top-down), **TAB** toggles
+AUTO ↔ MANUAL, **+ / −** change the cruise speed, **R** resets, **ESC** quits.
+In MANUAL mode you steer with the arrow keys - useful for *feeling* the tire
+dynamics (the yaw rate and sideslip lag behind your steering input, exactly as
+in a real car).
+
+**5. (Optional) Run on CARLA.**
+
+```bash
+# install CARLA's Python API to match your server build
+pip install carla==<your CARLA server version>
+
+# start the simulator (separate terminal), wait for the map to load
+./CarlaUE4.sh                      # Windows: CarlaUE4.exe
+
+# then, in the venv:
+dcmpc-carla --debug
+```
+
+If CARLA refuses to connect, it's almost always (a) the server isn't finished
+loading, or (b) a port clash on 2000 - see [Debugging the LiDAR](#debugging-the-lidar)
+and the troubleshooting note at the end of this section.
+
+**6. Inspect a CARLA run.** Every CARLA session writes `carla_trace_*.csv`:
+
+```bash
+dcmpc-plot                         # plots the newest trace
+```
+
+> **CARLA connection troubleshooting.** If you see a 10 s timeout: confirm the
+> server window is fully loaded; check the port with `netstat -ano | findstr 2000`
+> (Windows). If two processes are listening on 2000, kill both and start CARLA
+> once. To use a non-default port, launch with `-carla-rpc-port=N` and set
+> `CARLA_PORT = N` in `src/dcmpc/carla_bridge.py`.
 
 ---
 
-## Configuring the scenario (`config.py`)
+## What each command does
+
+| Command | Description |
+|---------|-------------|
+| `dcmpc-sim`    | Headless closed-loop sim → `result.png`, `telemetry.png`, `demo.gif` |
+| `dcmpc-drive`  | Live pygame viewer: 3D chase + top-down split (recommended) |
+| `dcmpc-3d`     | Live 3D chase camera only |
+| `dcmpc-top`    | Live top-down only |
+| `dcmpc-manual` | Open-loop: drive with your own scripted inputs (feel the dynamics) |
+| `dcmpc-carla`  | CARLA bridge with virtual-LiDAR perception |
+| `dcmpc-plot`   | Plot a `carla_trace_*.csv` from a CARLA run |
+
+Useful flags: `dcmpc-sim --no-gif` (skip the slow animation), `dcmpc-carla
+--debug` (per-tick logging), `dcmpc-carla --no-lidar` (use ground-truth actor
+positions instead of LiDAR), `dcmpc-carla --view-lidar` (live 2-D filter-debug
+plot), `dcmpc-carla --view-lidar-3d` (live 3-D semantic point cloud).
+
+As a library:
 
 ```python
-# Road centreline waypoints (metres) — add/move/remove to reshape the track
-TRACK_X = [0, 60, 120, ...]
-TRACK_Y = [0,  0,  10, ...]
-
-# Cruise speed the controller tries to maintain
-TARGET_SPEED = 11.0          # m/s  (~40 km/h)
-
-# Obstacles — place as many as you like
-OBSTACLES = [
-    {"along": 0.13, "offset":  1.8, "radius": 2.5},  # fraction of lap, metres left
-    {"along": 0.40, "offset": -2.0, "radius": 2.0},
-    {"x": 77.0, "y": 3.0, "radius": 2.5},            # or exact world coords
-]
-
-# Car physics (Tesla Model 3 defaults)
-CAR = dict(m=1845.0, Iz=2600.0, lf=1.44, lr=1.44, Cf=140000.0, Cr=160000.0)
-
-# Obstacle avoidance tuning
-OBSTACLE_SAFETY_MARGIN = 1.5  # metres clearance from obstacle surface
-ROAD_HALFWIDTH = 5.0          # drivable width for overtake/stop decision
-PASS_ZONE = 6.0               # longitudinal extent of the keep-out zone [m]
+from dcmpc import DynamicBicycleMPC, CarParams, AdaptiveSpeed, get_ref_trajectory
 ```
 
 ---
 
-## Vehicle model
+## Debugging the LiDAR
 
-**State** `X = [x, y, ψ, vx, vy, r]` — position, yaw, longitudinal velocity,
-lateral velocity, yaw rate. **Control** `u = [a, δ]` — acceleration and front
-steering angle.
+In CARLA the obstacles fed to the MPC come from a **virtual LiDAR**: the raw
+point cloud is filtered (height band, forward field-of-view, range, ego
+exclusion), grid-clustered, and each surviving cluster becomes a circular
+keep-out. When the car stops with apparent free space, or swerves at nothing,
+you need to *see what the perception layer sees*:
+
+```bash
+dcmpc-carla --view-lidar
+```
+
+A live top-down Matplotlib window opens, colour-coded by filter stage:
+
+| Colour | Meaning |
+|--------|---------|
+| **Grey** | returns dropped by the height filter (ground, overhead) |
+| **Orange** | dropped by FOV / range / ego-exclusion |
+| **Green** | survived all filters → handed to clustering |
+| **Red circle** | a detected obstacle the MPC actually receives (centre + keep-out radius) |
+
+Reading it: if a wall shows up as a **red circle**, raise `LIDAR_MIN_PTS` or
+lower `LIDAR_MAX_RADIUS` in `config.py`. If a real car never turns **green**,
+loosen the height band (`LIDAR_Z_MIN`, `LIDAR_Z_MAX`) or widen `LIDAR_FOV_DEG`.
+All of these live in the config (see *Configuring* below).
+
+### 3D semantic view (like a real AV stack)
+
+For a richer view - a 3D perspective cloud where **each detected cluster gets
+its own colour** (cars, poles, scenery), the ground dimmed, and the ego car at
+the origin - use:
+
+```bash
+dcmpc-carla --view-lidar-3d
+```
+
+This uses **Open3D** if installed (`pip install open3d`, included in the `gui`
+extra) for a dense, mouse-orbitable GPU window; if Open3D isn't present it falls
+back automatically to a lower-fidelity matplotlib-3D window. The clustering used
+for colouring is computed independently for the display and never touches the
+controller, so the view can't affect driving. You can run `--view-lidar` (2-D
+filter debug) and `--view-lidar-3d` (semantic 3-D) together or separately.
+
+> Both live views redraw every tick and **slow the loop down** - use them for
+> debugging, not timed runs.
+
+---
+
+## Package layout
 
 ```
-ẋ   = vx·cos ψ − vy·sin ψ
+src/dcmpc/
+├── __init__.py        # public API: DynamicBicycleMPC, AdaptiveSpeed, helpers
+├── controller.py      # vehicle model + iMPC + AdaptiveSpeed + path helpers
+├── config.py          # EDIT THIS: road, obstacles, speed, car physics, CARLA
+├── simulate.py        # headless closed-loop sim
+├── manual_drive.py    # open-loop scripted inputs
+├── carla_bridge.py    # CARLA bridge + virtual-LiDAR perception + 2-D viewer
+├── lidar_view3d.py    # 3-D semantic point-cloud viewer (Open3D / matplotlib)
+├── plot_trace.py      # CARLA CSV trace plots
+└── viz/
+    ├── drive.py       # unified split-screen viewer
+    ├── top_down.py    # standalone top-down
+    └── chase_3d.py    # standalone 3D chase camera
+```
+
+Because the install is editable, editing `src/dcmpc/config.py` takes effect
+immediately - no reinstall.
+
+---
+
+## The maths, and why the car behaves the way it does
+
+### 1. State and the dynamic bicycle model
+
+The car is modelled as a single track (front and rear axles each collapsed to
+one wheel). The state and control are
+
+```
+X = [x, y, ψ, vx, vy, r]          u = [a, δ]
+```
+
+`x, y` position, `ψ` heading, `vx` longitudinal and `vy` lateral velocity (both
+in the car's own frame), `r` yaw rate; `a` longitudinal acceleration, `δ` front
+steering angle. The continuous dynamics `Ẋ = f(X, u)` are
+
+```
+ẋ   = vx·cos ψ − vy·sin ψ          (body velocity rotated into the world)
 ẏ   = vx·sin ψ + vy·cos ψ
 ψ̇   = r
 v̇x  = a + vy·r
@@ -119,121 +217,226 @@ v̇y  = (Fyf + Fyr)/m − vx·r
 ṙ   = (lf·Fyf − lr·Fyr)/Iz
 ```
 
-Tire forces from slip angles (linear model with saturation and low-speed fade):
+The two terms that make this a *dynamic* model rather than a *kinematic* one are
+the `vy·r` / `vx·r` cross-couplings (centripetal effects) and, crucially, the
+tire forces `Fyf`, `Fyr`. A kinematic bicycle assumes the car goes exactly where
+the wheels point; this model lets the tires **slip**, which is what actually
+happens above walking pace and is the whole point of using it.
+
+### 2. Tire forces and slip angles - the source of the behaviour
+
+Each tire generates lateral force in proportion to its **slip angle** - the
+angle between where the tire points and where it's actually travelling:
 
 ```
-αf = δ − (vy + lf·r)/vx        Fyf = Cf·αf
-αr =   − (vy − lr·r)/vx        Fyr = Cr·αr
+αf = δ − (vy + lf·r)/vx        Fyf = Cf · αf
+αr =   − (vy − lr·r)/vx        Fyr = Cr · αr
 ```
 
-The model is validated before use: at 13 m/s the lateral eigenvalues are
-stable (`−15.5 ± 1.2j`), steady-state cornering shows mild understeer, and
-the discretized model (matrix-exponential ZOH) is numerically stable.
+`Cf`, `Cr` are the cornering stiffnesses. This linear law is why **the
+front-to-rear stiffness balance sets the handling character**:
 
-**Two physical guards keep the model valid at the limits:**
-- **Slip-angle saturation** (`α_max = 0.12 rad`) — tires have a grip ceiling.
-- **Low-speed fade** — lateral forces and yaw accel fade to zero below 2 m/s,
-  preventing the singularity at standstill from causing divergence.
+- `lf·Cf > lr·Cr`-ish balance → the rear grips relatively harder → mild
+  **understeer** (the safe, stable default; the car gently pushes wide and
+  self-corrects). This project's default Tesla-like parameters are tuned here.
+- Lower `Cr` relative to `Cf` → the rear lets go first → **oversteer** (the tail
+  steps out). Try it in `config.py` and watch the sideslip trace grow.
 
----
+Two guards keep this valid at the limits, and both shape the behaviour you see:
 
-## Controller architecture
+- **`tanh` slip saturation:** `α ← α_max · tanh(α/α_max)`. A real tire has a grip
+  ceiling - past a few degrees of slip the force stops climbing. The hard clamp
+  we used originally has a *zero* derivative past the limit, which makes the
+  linearization (below) singular and the solver stall. `tanh` saturates smoothly,
+  so the Jacobian stays well-conditioned. This is why solves are stable even in
+  hard avoidance manoeuvres.
+- **Low-speed fade:** `fade = min(1, |vx|/v_blend)` multiplies the lateral and
+  yaw accelerations. The slip-angle formulas divide by `vx`, which blows up as
+  the car approaches a stop. Fading the lateral dynamics to zero below a few m/s
+  removes that singularity - the model degrades gracefully to "can't generate
+  cornering force at standstill," which is physically correct.
 
-The MPC works in the **ego frame** each tick: the reference trajectory is
-expressed relative to the car's current pose, so `solve()` always receives
-`[0, 0, 0, vx, vy, r]` as the initial state. The optimal plan is converted
-back to world coordinates with `ego_to_global`.
+**Why steering feels laggy in MANUAL mode:** a step of `δ` doesn't instantly
+become yaw rate. It first creates a front slip angle, which builds `Fyf`, which
+produces `ṙ`, which integrates into `r`, which then changes the slip angles
+again. That chain of integrations is the real first-order-ish lag you see in the
+yaw-rate and sideslip telemetry - the signature of a dynamic model.
 
-The QP is **DPP-compliant** — parameters enter as `Parameter @ Variable` so
-CVXPY canonicalises once and reuses the structure, giving ~70–80 ms solves at
-10 Hz (real-time). Solver fallback chain: OSQP (warm, polished) → CLARABEL
-(cold) → OSQP (cold). Emergency brake on total failure; warm start resets.
+### 3. From nonlinear model to a QP: linearize, then discretize exactly
 
----
+MPC needs a *linear* model at each step. Around the current operating point
+`(x̄, ū)` we take a first-order expansion `Ẋ ≈ A·X + B·u + c`, where `A`, `B`
+are Jacobians and `c` is the affine residual. We compute `A`, `B` by **finite
+differences** (`controller._model_matrices`): it keeps the tire algebra in one
+obviously-correct place and is robust to the `tanh` nonlinearity. (Analytic
+Jacobians would be a pure speed optimization.)
 
-## Adaptive speed (`AdaptiveSpeed`)
+We then need the **discrete** step `X_{k+1} = A_d·X_k + B_d·u_k + C_d`. Rather
+than forward Euler (`A_d ≈ I + A·dt`), which can turn the stiff lateral modes
+*unstable* for the step sizes we use, we discretize **exactly** with a single
+matrix exponential (zero-order hold). Stacking `A`, `B`, `c` into one augmented
+matrix `Φ` and exponentiating gives `A_d`, `B_d`, `C_d` in one shot:
 
-The car does not maintain a fixed cruise speed. `AdaptiveSpeed` modulates the
-speed reference each tick based on three behaviours:
-
-1. **Obstacle braking** — smooth deceleration proportional to proximity,
-   starting 40 m from the obstacle surface and reaching minimum speed at 12 m.
-2. **Corner slowdown** — looks 25 m ahead, finds the tightest curvature `κ`,
-   and caps speed at `v_max = √(a_lat / κ)` (comfortable lateral-g limit).
-   Speed rises automatically on straights.
-3. **Smooth transitions** — first-order low-pass (τ = 1.2 s) so speed changes
-   feel gradual, not stepped.
-
-The HUD `ADAPT` row shows the active speed and the reason in colour:
-green = FREE, amber = CORNER, red = OBS.
-
----
-
-## Obstacle avoidance
-
-Obstacles are enforced as **soft half-plane constraints** with a slack penalty.
-The controller makes one of three decisions per tick:
-
-| Situation | Decision |
-|-----------|----------|
-| Obstacle offset; room to pass | **LANE-CHANGE** — lateral keep-out on the far side, gated to the length alongside the obstacle |
-| Obstacle centred; room either side | **LANE-CHANGE** — picks the side with more margin |
-| No room to pass (narrow road) | **STOP** — longitudinal keep-out + zero speed reference |
-
-The minimum clearance between the car body and obstacle surface is controlled
-by `OBSTACLE_SAFETY_MARGIN` in `config.py` (default 1.5 m → measured buffer
-~2.4 m from obstacle centre).
-
----
-
-## CARLA integration (`carla_mpc.py`)
-
-```bash
-./CarlaUE4.sh                 # start CARLA server (Town10HD)
-pip install carla
-python carla_mpc.py           # INFO logging + CSV trace
-python carla_mpc.py --debug   # per-tick details
-python carla_mpc.py --quiet   # warnings/errors only
-python carla_mpc.py --no-csv  # skip the CSV trace
-python carla_mpc.py --no-obstacle  # don't spawn stalled cars
+```
+        ⎡ A  B  c ⎤
+Φ·dt =  ⎢ 0  0  0 ⎥ · dt        exp(Φ·dt) → top block = [A_d  B_d  C_d]
+        ⎣ 0  0  0 ⎦
 ```
 
-Key things the bridge does:
-- Builds the reference path from the **actual CARLA lane** (not a hand-coded
-  spline), following waypoints for up to 800 m.
-- **Spawns the car on `path[0]` facing along the path** — eliminates the
-  heading-mismatch bug that causes the car to steer off-road at startup.
-- Reads the vehicle's **real max steering angle** from `get_physics_control()`.
-- **Three stalled obstacle cars** spawned along the route; all destroyed on exit.
-- Adaptive speed active (slower defaults for town driving).
-- Writes a per-tick **CSV trace** (`carla_trace_<timestamp>.csv`); plot it with
-  `python plot_trace.py` to see cross-track error, heading error, speed, and
-  steering over time, with red lines marking emergency-brake ticks.
+This is why the prediction stays stable even though the lateral dynamics are
+stiff.
 
-Default vehicle: `vehicle.audi.tt`. Change `VEHICLE_FILTER` at the top of
-`carla_mpc.py`. Run this to list what's available in your build:
+### 4. The optimization (QP)
 
-```bash
-python -c "import carla; w=carla.Client('localhost',2000).get_world(); [print(b.id) for b in w.get_blueprint_library().filter('vehicle.*')]"
+Over a horizon of `N` steps we solve, each control cycle,
+
+```
+min  Σ_k [ ‖X_k − X_ref,k‖²_Q + ‖u_k‖²_R + ‖u_k − u_{k−1}‖²_Rd ]
+       + ‖X_N − X_ref,N‖²_Qf  +  ρ·Σ_k Σ_j s_{j,k}
+
+s.t. X_{k+1} = A_d,k X_k + B_d,k u_k + C_d,k      (dynamics)
+     X_0 = current state
+     control & rate limits
+     n_{j,k} · X_{k+1} ≥ b_{j,k} − s_{j,k},  s ≥ 0  (obstacle half-planes)
 ```
 
+- `Q = diag(5, 150, 8, 40, 2, 2)` - the large weight on `y` (150) is lateral
+  tracking; that's what keeps the car pinned to the path.
+- `Rd = (1, 250)` heavily penalises **steering-rate** changes - this is what
+  stops the violent snap-back during a lane change and gives the smooth re-entry.
+- The constraints are **soft**: a slack `s` with a big penalty `ρ = 1e5` lets a
+  geometrically impossible request degrade gracefully (squeeze the margin a
+  little) instead of returning "infeasible" and triggering an emergency brake.
+
+The whole problem is built to be **DPP-compliant** (every parameter enters as
+`Parameter @ Variable`), so CVXPY canonicalises the structure once and only
+swaps in numbers each cycle. That's what gets solve times to ~60-80 ms at 10 Hz.
+The solver is wrapped in an OSQP→CLARABEL→OSQP fallback chain, with an emergency
+brake only if all of them fail on the same cycle.
+
+### 5. Obstacle avoidance as half-planes
+
+Each obstacle becomes one or more **half-plane** keep-outs. With the obstacle at
+`o`, a keep-out radius `R = r_obs + buffer`, and a chosen normal `n` (pointing
+from the obstacle toward the side we pass on), the constraint
+
+```
+n · (X_xy − o) ≥ R
+```
+
+forbids the car from entering the disc on that side. When the car is still
+approaching, `n` points longitudinally (stay behind / slow); as it comes
+alongside, `n` rotates lateral (push to the open side) - a smooth bulge around
+the obstacle. The MPC carries up to `MAX_OBS` of these simultaneously, so it can
+thread between several obstacles at once. Which side it commits to is **locked in
+world coordinates** so the choice can't flip frame-to-frame as the car moves
+(the cause of the earlier spinning).
+
+If neither side has room (`max(room_left, room_right) < 0`), the decision flips
+to **stop**: the position reference is clamped to a stop line behind the obstacle
+and the speed reference is zeroed, so the controller brakes to a halt instead of
+fighting a forward-pulling reference.
+
+### 6. Human-like speed (`AdaptiveSpeed`)
+
+The car does not hold a fixed speed. Three effects shape the speed reference:
+
+- **Corner slowdown.** Looking ahead along the path, we find the tightest
+  curvature `κ` and cap speed so lateral acceleration stays within a comfortable
+  limit. This is just circular-motion physics, `a_lat = v²·κ`, solved for `v`:
+
+  ```
+  v_max = √(a_lat_comfort / κ)
+  ```
+
+  Higher `a_lat_comfort` → faster, more aggressive cornering; the pygame default
+  is 4.5 m/s², while the CARLA bridge passes a cautious 1.5 m/s² for town driving.
+
+- **Obstacle braking.** Speed is reduced in proportion to proximity, scaling from
+  cruise down to a floor as the obstacle nears.
+
+- **Smoothing.** The result is passed through a first-order low-pass (time
+  constant τ), so the car eases on and off the throttle rather than stepping -
+  the gradual feel a human gives.
+
+The HUD's `ADAPT` row shows which effect is active (green = FREE, amber =
+CORNER, red = OBS).
+
+### 7. A dynamically feasible reference
+
+The reference itself respects acceleration limits: instead of placing reference
+points at a constant `target_v`, `get_ref_trajectory` integrates a speed profile
+that ramps up/down within ±a few m/s², so the MPC is never asked to track a
+step it physically can't. A **recovery mode** throttles that reference speed when
+the car is pushed far off-line (cross-track > 1.5 m), giving the solver room to
+steer gently back instead of diverging.
+
 ---
 
-## Manual drive (`manual_drive.py`)
+## Configuring the scenario
 
-Edit the `INPUTS` list — a schedule of `(duration, acceleration, steer)` — and
-run `python manual_drive.py`. No controller in the loop; this is the best way to
-feel the dynamic model: a step of steering doesn't instantly become a turn rate,
-the car's mass and tires take a moment to respond (yaw-rate lag, sideslip build-up).
+**Every tunable in the project lives in one place - `src/dcmpc/config.py`** -
+grouped by subsystem, each with a comment explaining what it does and which way
+to turn it. Because the install is editable, edits take effect with no reinstall.
+The groups:
+
+- **Road** - `TRACK_X` / `TRACK_Y` centreline waypoints (a smooth spline is fit
+  through them).
+- **Speed** - `TARGET_SPEED`, `START_SPEED`.
+- **Obstacles** - the `OBSTACLES` list: place by world coords `{"x","y","radius"}`
+  or relative to the road `{"along": 0-1, "offset": ±m, "radius"}`.
+- **Car physics** - `CAR = dict(m, Iz, lf, lr, Cf, Cr)`. Lower `Cr` for
+  oversteer; raise it for more understeer.
+- **Controller limits** - `MAX_SPEED`, `MAX_ACC`, `MAX_D_ACC`, `MAX_STEER`,
+  `MAX_D_STEER`: the physical envelope the MPC may command.
+- **Cost weights** - `STATE_COST`, `FINAL_STATE_COST`, `INPUT_COST`,
+  `INPUT_RATE_COST`: what the MPC optimises. Raise the cross-track term for
+  tighter path-following; raise the steering-rate term for smoother steering.
+- **Avoidance** - `OBSTACLE_SAFETY_MARGIN` (clearance), `ROAD_HALFWIDTH`
+  (overtake-vs-stop), `PASS_ZONE` (keep-out length past the obstacle),
+  `SLACK_PENALTY`.
+- **Adaptive speed** - `ADAPT_A_LAT_COMFORT` (cornering aggressiveness),
+  `ADAPT_LOOKAHEAD`, `ADAPT_OBS_BRAKE_START/END`, `ADAPT_V_MIN`, `ADAPT_TAU`.
+- **Timing** - `DT`, `HORIZON_TIME`.
+- **CARLA** - `CARLA_TARGET_SPEED`, throttle/brake mapping, detected-obstacle
+  radius, `CARLA_A_LAT_COMFORT`.
+- **Virtual LiDAR** - `LIDAR_Z_MIN/MAX` (height band), `LIDAR_FOV_DEG`,
+  `LIDAR_EGO_EXCLUSION`, `LIDAR_MAX_RANGE`, `LIDAR_CLUSTER_CELL`, `LIDAR_MIN_PTS`,
+  `LIDAR_MAX_RADIUS` (wall rejection). These decide what the perception layer
+  treats as an obstacle versus ground/wall/scenery.
+
+Quick tuning cheatsheet (also at the top of the file):
+
+| Symptom | Knob |
+|---------|------|
+| Passes obstacles too close | raise `OBSTACLE_SAFETY_MARGIN` |
+| Swerves too wide | lower `OBSTACLE_SAFETY_MARGIN` |
+| Too timid in corners | raise `ADAPT_A_LAT_COMFORT` |
+| Cuts back in too early after a pass | raise `PASS_ZONE` |
+| Drifts off the path | raise `STATE_COST` cross-track term (index 1) |
+| Steering oscillates / snaps | raise `INPUT_RATE_COST` steering term (index 1) |
+| Walls detected as obstacles (CARLA) | raise `LIDAR_MIN_PTS` or lower `LIDAR_MAX_RADIUS` |
 
 ---
 
-## Possible extensions
+## Performance note (CARLA frame rate)
 
-| Extension | What it adds |
-|-----------|-------------|
-| Pacejka "magic formula" tire model | Grip saturation, realistic limit-handling |
-| Multi-obstacle simultaneous constraints | Handle clusters, not just nearest-one |
-| ROS 2 bridge | Publish to a real vehicle or Gazebo |
-| PyOpenGL / Ursina 3D view | Photoreal rendering without CARLA |
-| System identification | Fit `Cf`, `Cr`, `Iz` to CARLA telemetry for tighter tracking |
+CARLA renders on the GPU; the MPC solves on the CPU. The QP solve is the
+per-tick bottleneck, so on a slower machine the control loop runs slower than
+CARLA's render rate. This is expected - it's a CPU optimisation problem, not a
+graphics one, and a GPU would not help a QP this small (the host↔device transfer
+overhead exceeds the solve). If you need more headroom, the CPU levers are:
+shorten `HORIZON_TIME` (solve time scales with horizon length) and keep the
+scene's obstacle count modest. These trade foresight for speed, so change them
+deliberately and re-test.
+
+---
+
+## Extensions
+
+Pacejka nonlinear tire model (a real friction ceiling instead of the linear-plus-
+`tanh` approximation), analytic Jacobians (faster solves), a ROS 2 bridge, and a
+learned-dynamics variant with conformal-prediction safety tubes for
+out-of-distribution robustness.
+
+See `CHANGELOG.md` for the full development history.

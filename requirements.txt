@@ -1,6 +1,34 @@
-cvxpy>=1.5
-numpy>=1.24
-scipy>=1.10
-matplotlib>=3.7
+# ============================================================================ #
+#  dcmpc - dependencies
+# ============================================================================ #
+# Recommended install (editable, with the viewers + 3D LiDAR window):
+#     pip install -e ".[viz,gui]"
+#
+# This requirements.txt is an alternative for a plain (non-editable) setup:
+#     pip install -r requirements.txt
+# It installs the core stack plus the pygame viewers and the 3D viewer deps.
+# CARLA's own Python package is installed separately (see the bottom note).
+# ============================================================================ #
+
+# --- core controller + solver (always required) ---
+numpy>=1.21
+scipy>=1.7
+cvxpy>=1.1
 osqp
-pygame>=2.5   # optional: only needed for the live drive_pygame.py window
+matplotlib>=3.4
+
+# --- live pygame viewers (dcmpc-drive / -3d / -top) ---
+pygame>=2.5
+
+# --- 3D semantic LiDAR window (dcmpc-carla --view-lidar-3d) ---
+# open3d gives the dense, mouse-orbitable point cloud; if it is not installed
+# the viewer falls back automatically to a matplotlib 3D window.
+open3d
+PyQt5
+
+# ============================================================================ #
+#  CARLA (install separately - the version MUST match your CARLA server build)
+#    pip install carla==0.9.15      # example for a 0.9.15 server
+#  It is intentionally left out of this file because the correct version is
+#  specific to your simulator install and Python version.
+# ============================================================================ #

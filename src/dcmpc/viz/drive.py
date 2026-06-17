@@ -1,5 +1,5 @@
 """
-Unified live visualizer — press V to switch layout:
+Unified live visualizer - press V to switch layout:
     SPLIT   fixed 3D chase (left half)  +  top-down motorsport (right half)
     3D      full-window 3D chase camera
     TOP     full-window top-down motorsport view
@@ -12,8 +12,9 @@ from __future__ import annotations
 import os, sys, math, time
 import numpy as np
 
-import config as C
-from dynamic_bicycle_mpc import (
+from dcmpc import config as C
+from dcmpc.controller import build_mpc, build_adaptive_speed  # noqa: F401
+from dcmpc.controller import (
     DynamicBicycleMPC, CarParams, rk4_step,
     compute_path_from_wp, get_ref_trajectory, ego_to_global,
     AdaptiveSpeed,
@@ -184,7 +185,7 @@ def _add_car3d(sc,cam,state,steer):
         for v,n in _box_faces(wx,wy,0.,0.9,0.38,0.54,wa): sc.add(cam,v,n,WHEEL_C)
 
 def _add_obs3d(sc,cam,ox,oy,orad,sides=16,ht=1.65):
-    # each face passes dist=None so it uses its own centroid — this is what
+    # each face passes dist=None so it uses its own centroid - this is what
     # makes the cylinder look round instead of flat (faces sort correctly)
     ring=[(ox+orad*math.cos(2*math.pi*k/sides),oy+orad*math.sin(2*math.pi*k/sides)) for k in range(sides)]
     sc.add(cam,[np.array([px,py,ht]) for px,py in ring],np.array([0.,0.,1.]),OBS_TOP_C)
@@ -273,7 +274,7 @@ def draw_overlay_hud(surf, state, ucmd, mode, target_v, lap_t, best_lap, laps, f
     chip.fill((*badge_col, 35))
     surf.blit(chip, (x, y))
     pygame.draw.rect(surf, badge_col, (x,y,bw,badge_h), 1, border_radius=6)
-    label = "AUTO – MPC" if mode=="AUTO" else "MANUAL – YOU"
+    label = "AUTO - MPC" if mode=="AUTO" else "MANUAL - YOU"
     surf.blit(fB.render(f"● {label}", True, badge_col), (x+8, y+(badge_h-B)//2))
     y += badge_h + GAP
 
@@ -391,7 +392,7 @@ def render_3d(surf, cam, path, obstacles, state, steer, plan_xy, vx, vy, vw, vh)
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  TOP-DOWN RENDERER  (from drive_pygame.py — full quality)
+#  TOP-DOWN RENDERER  (from drive_pygame.py - full quality)
 # ══════════════════════════════════════════════════════════════════════
 class CameraTop:
     def __init__(self,path,obstacles,x0,y0,w,h):
@@ -474,7 +475,7 @@ def render_top(surf, cam, path, obstacles, state, steer, plan_xy, show_hud=True,
 
     surf.set_clip(None)
 
-    # HUD (only on top-down full or split-right — when viewport starts at x0=0 or right half)
+    # HUD (only on top-down full or split-right - when viewport starts at x0=0 or right half)
     if show_hud and fonts and ucmd is not None:
         fB,fM,fS=fonts; vx2=state[3]; vy2=state[4]; r2=state[5]
         steer_d=math.degrees(ucmd[1]); lat_g=vx2*r2/9.81; lon_g=ucmd[0]/9.81
@@ -490,7 +491,7 @@ def render_top(surf, cam, path, obstacles, state, steer, plan_xy, show_hud=True,
         bc=ACCENT if mode=="AUTO" else AMBER
         badge=pygame.Surface((HUD_W-20,34),pygame.SRCALPHA); badge.fill((*bc,40)); surf.blit(badge,(hx+10,yy))
         pygame.draw.rect(surf,bc,(hx+10,yy,HUD_W-20,34),2,border_radius=4)
-        surf.blit(fB.render("● AUTO – MPC" if mode=="AUTO" else "◆ MANUAL – YOU",True,bc),(hx+18,yy+5)); yy+=44
+        surf.blit(fB.render("● AUTO - MPC" if mode=="AUTO" else "◆ MANUAL - YOU",True,bc),(hx+18,yy+5)); yy+=44
         sep_()
         sp_s=fB.render(f"{vx2*3.6:5.1f}",True,C_WHITE); surf.blit(sp_s,(hx+14,yy))
         surf.blit(fS.render("km/h",True,C_DIM),(hx+14+sp_s.get_width()+4,yy+sp_s.get_height()-fS.get_height())); yy+=sp_s.get_height()+2
@@ -555,11 +556,8 @@ def main():
     path,obstacles=build_world()
     p=CarParams()
     for k,v in C.CAR.items(): setattr(p,k,v)
-    mpc=DynamicBicycleMPC(params=p,dt=C.DT,horizon_time=C.HORIZON_TIME,
-                          road_halfwidth=getattr(C,"ROAD_HALFWIDTH",5.),
-                          pass_zone=getattr(C,"PASS_ZONE",6.),
-                          safety_margin=getattr(C,"OBSTACLE_SAFETY_MARGIN",1.5))
-    speed_ctrl=AdaptiveSpeed(base_speed=C.TARGET_SPEED)
+    mpc = build_mpc(C)
+    speed_ctrl = build_adaptive_speed(C)
     cam3d=Camera3D()
 
     LAYOUTS=["SPLIT","3D","TOP"]; li=0
@@ -599,7 +597,7 @@ def main():
             ego_obs=sense(state,obstacles)
             adaptive_v=speed_ctrl.update(state,path,ego_obs,C.DT)
             tgt=get_ref_trajectory(state,path,adaptive_v,mpc.control_horizon*C.DT,C.DT)
-            traj,u=mpc.solve(np.array([0.,0.,0.,state[3],state[4],state[5]]),tgt,obstacle=ego_obs,max_iter=3)
+            traj,u=mpc.solve(np.array([0.,0.,0.,state[3],state[4],state[5]]),tgt,obstacle=ego_obs,max_iter=getattr(C, "MPC_MAX_ITER", 3))
             plan_xy=ego_to_global(state,traj) if traj is not None else None
             ucmd=u[:,0]; steer=ucmd[1]; state=rk4_step(state,ucmd,C.DT,p,substeps=5)
             if np.hypot(state[0]-path[0,-1],state[1]-path[1,-1])<4.:

@@ -69,7 +69,7 @@ def main():
 
     for a in ax:
         a.grid(alpha=.3)
-    ax[0].set_title(f"CARLA MPC trace — {path}  (red lines = emergency brake)")
+    ax[0].set_title(f"CARLA MPC trace - {path}  (red lines = emergency brake)")
     fig.tight_layout()
     out = path.replace(".csv", ".png")
     fig.savefig(out, dpi=110, bbox_inches="tight")

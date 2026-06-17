@@ -1,5 +1,5 @@
 """
-3D chase-camera visualizer — standalone, same renderer as drive.py.
+3D chase-camera visualizer - standalone, same renderer as drive.py.
 
 Modes (TAB): AUTO (MPC drives) / MANUAL (arrow keys)
 Keys: TAB mode | R reset | + / - target speed | ESC quit
@@ -10,8 +10,9 @@ from __future__ import annotations
 import os, sys, math, time
 import numpy as np
 
-import config as C
-from dynamic_bicycle_mpc import (
+from dcmpc import config as C
+from dcmpc.controller import build_mpc, build_adaptive_speed  # noqa: F401
+from dcmpc.controller import (
     DynamicBicycleMPC, CarParams, rk4_step,
     compute_path_from_wp, get_ref_trajectory, ego_to_global,
     AdaptiveSpeed,
@@ -208,7 +209,7 @@ def add_car(scene, cam, state, steer):
 def add_obstacle(scene, cam, ox, oy, orad, sides=16, ht=1.65):
     ring = [(ox + orad*math.cos(2*math.pi*k/sides),
              oy + orad*math.sin(2*math.pi*k/sides)) for k in range(sides)]
-    # top cap — own centroid distance
+    # top cap - own centroid distance
     scene.add(cam, [np.array([px, py, ht]) for px, py in ring],
               np.array([0.,0.,1.]), OBS_TOP_C)
     for k in range(sides):
@@ -333,7 +334,7 @@ def draw_hud(surf, state, ucmd, mode, target_v, lap_t, best_lap, laps, fonts,
     chip = pygame.Surface((bw, bh), pygame.SRCALPHA); chip.fill((*bc, 35))
     surf.blit(chip, (x, y))
     pygame.draw.rect(surf, bc, (x, y, bw, bh), 1, border_radius=6)
-    label = "AUTO – MPC" if mode == "AUTO" else "MANUAL – YOU"
+    label = "AUTO - MPC" if mode == "AUTO" else "MANUAL - YOU"
     surf.blit(fB.render(f"● {label}", True, bc), (x+8, y+(bh-B)//2))
     y += bh + GAP
 
@@ -407,7 +408,7 @@ def draw_hud(surf, state, ucmd, mode, target_v, lap_t, best_lap, laps, fonts,
 def main():
     pygame.display.init(); pygame.font.init()
     screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Dynamic-bicycle car MPC — 3D")
+    pygame.display.set_caption("Dynamic-bicycle car MPC - 3D")
     clock = pygame.time.Clock()
     fB = pygame.font.SysFont("consolas,menlo,monospace", 24, bold=True)
     fM = pygame.font.SysFont("consolas,menlo,monospace", 19)
@@ -416,11 +417,8 @@ def main():
     path, obstacles = build_world()
     p = CarParams()
     for k, v in C.CAR.items(): setattr(p, k, v)
-    mpc = DynamicBicycleMPC(params=p, dt=C.DT, horizon_time=C.HORIZON_TIME,
-                            road_halfwidth=getattr(C, "ROAD_HALFWIDTH", 5.),
-                            pass_zone=getattr(C, "PASS_ZONE", 6.),
-                            safety_margin=getattr(C, "OBSTACLE_SAFETY_MARGIN", 1.5))
-    speed_ctrl = AdaptiveSpeed(base_speed=C.TARGET_SPEED)
+    mpc = build_mpc(C)
+    speed_ctrl = build_adaptive_speed(C)
     cam = Camera()
 
     target_v = C.TARGET_SPEED
@@ -454,7 +452,7 @@ def main():
             adaptive_v = speed_ctrl.update(state, path, ego_obs, C.DT)
             tgt = get_ref_trajectory(state, path, adaptive_v, mpc.control_horizon*C.DT, C.DT)
             traj, u = mpc.solve(np.array([0.,0.,0.,state[3],state[4],state[5]]),
-                                tgt, obstacle=ego_obs, max_iter=3)
+                                tgt, obstacle=ego_obs, max_iter=getattr(C, "MPC_MAX_ITER", 3))
             plan_xy = ego_to_global(state, traj) if traj is not None else None
             ucmd = u[:,0]; steer = ucmd[1]
             state = rk4_step(state, ucmd, C.DT, p, substeps=5)

@@ -44,22 +44,28 @@ from scipy.linalg import expm
 
 
 def vehicle_dynamics(X, u, p):
-    """Continuous dynamic-bicycle dynamics f(X, u) for car parameters `p`.
-
-    X = [x, y, psi, vx, vy, r], u = [a, delta]. Reused by the controller's
-    linearization and by the open-loop simulator (manual_drive.py)."""
+    """Continuous dynamic-bicycle dynamics f(X, u) for car parameters `p`."""
     _, _, psi, vx, vy, r = X
     a, delta = u
-    vxs = vx if abs(vx) > p.v_min else (p.v_min if vx >= 0 else -p.v_min)
+    
+    # Smooth floor prevents step-function explosions near 0 m/s
+    vxs = max(vx, p.v_min)
+    
     alpha_f = delta - (vy + p.lf * r) / vxs
     alpha_r = -(vy - p.lr * r) / vxs
-    am = getattr(p, "alpha_max", 0.12)        # tire grip limit (slip saturation)
-    alpha_f = max(-am, min(am, alpha_f))
-    alpha_r = max(-am, min(am, alpha_r))
+    
+    am = getattr(p, "alpha_max", 0.12)        
+    
+    # Soft saturation guarantees a continuous, non-zero derivative for the solver
+    alpha_f = am * np.tanh(alpha_f / am)
+    alpha_r = am * np.tanh(alpha_r / am)
+    
     Fyf = p.Cf * alpha_f
     Fyr = p.Cr * alpha_r
-    vb = getattr(p, "v_blend", 2.0)           # fade lateral dynamics below this
-    fade = min(1.0, abs(vx) / vb)             # 0 at standstill, 1 above v_blend
+    
+    vb = getattr(p, "v_blend", 2.0)           
+    fade = min(1.0, abs(vx) / vb)             
+    
     return np.array([
         vx * np.cos(psi) - vy * np.sin(psi),
         vx * np.sin(psi) + vy * np.cos(psi),
@@ -104,6 +110,7 @@ class CarParams:
 class DynamicBicycleMPC:
     STATE_DIM = 6     # [x, y, psi, vx, vy, r]
     CONTROL_DIM = 2   # [a, delta]
+    MAX_OBS = 4       # max simultaneous obstacle keep-out constraints
 
     def __init__(
         self,
@@ -117,14 +124,22 @@ class DynamicBicycleMPC:
         max_steer: float = 0.5,       # rad (~29 deg)
         max_d_steer: float = 0.6,     # rad/s (steering rate)
         # cost weights: state = [along, cross, vx, psi, vy, r], ctrl = [a, delta]
-        state_cost: tuple[float, ...] = (5, 80, 8, 40, 2, 2),
+        state_cost: tuple[float, ...] = (5, 150, 8, 40, 2, 2),
         final_state_cost: tuple[float, ...] = (5, 80, 8, 40, 2, 2),
+        # ... existing code ...
         input_cost: tuple[float, ...] = (1, 5),
-        input_rate_cost: tuple[float, ...] = (1, 60),
+        
+        # FIX: Increase steering rate penalty from 60 to 250. 
+        # This prevents violent snap-backs and forces a smooth lane re-entry.
+        input_rate_cost: tuple[float, ...] = (1, 250),
+        
         safety_margin: float = 0.5,
         slack_penalty: float = 1e5,
-        road_halfwidth: float = 5.0,   # drivable half-width for the pass decision
-        pass_zone: float = 6.0,        # how far along the road the keep-out spans
+        road_halfwidth: float = 5.0,
+        
+        # FIX: Increase pass_zone from 6.0 to 18.0.
+        # This prevents the MPC from looking past the obstacle and cutting in early.
+        pass_zone: float = 18.0, 
     ) -> None:
         self.p = params or CarParams()
         self.dt = dt
@@ -140,6 +155,7 @@ class DynamicBicycleMPC:
         self._pass_zone = pass_zone
         self._last_obstacle_action = "none"
         self._obs_side_lock = None    # committed pass side; held until obstacle clears
+        self._obs_locks = {}          # per-obstacle committed side, keyed by rounded pos
 
         self.q = np.diag(state_cost)
         self.qf = np.diag(final_state_cost)
@@ -151,11 +167,13 @@ class DynamicBicycleMPC:
 
         N = self.control_horizon
         n, m = self.STATE_DIM, self.CONTROL_DIM
+        J = self.MAX_OBS
 
         # --- decision variables ---
         self._states = opt.Variable((n, N + 1), name="states")
         self._controls = opt.Variable((m, N), name="controls")
-        self._slack = opt.Variable(N, nonneg=True, name="obstacle_slack")
+        # one slack vector per obstacle slot
+        self._slack = [opt.Variable(N, nonneg=True, name=f"slack{j}") for j in range(J)]
         self._err = opt.Variable((n, N + 1), name="track_error")
 
         # --- parameters (all in Parameter-matrix @ Variable form for DPP) ---
@@ -166,8 +184,9 @@ class DynamicBicycleMPC:
         self._C = [opt.Parameter(n) for _ in range(N)]
         self._M = [opt.Parameter((n, n)) for _ in range(N + 1)]
         self._ref = [opt.Parameter(n) for _ in range(N + 1)]
-        self._obs_n = [opt.Parameter(n) for _ in range(N)]
-        self._obs_safe = opt.Parameter(N)
+        # one half-plane (normal + offset) per slot per step
+        self._obs_n = [[opt.Parameter(n) for _ in range(N)] for _ in range(J)]
+        self._obs_safe = [opt.Parameter(N) for _ in range(J)]
 
         self._prev_traj: npt.NDArray | None = None
         self._prev_u: npt.NDArray | None = None
@@ -234,11 +253,13 @@ class DynamicBicycleMPC:
             ]
             cost += opt.quad_form(self._err[:, k], self.q)
 
-            constraints += [
-                self._obs_n[k] @ self._states[:, k + 1]
-                >= self._obs_safe[k] - self._slack[k]
-            ]
-            cost += self._slack_penalty * self._slack[k]
+            # one soft half-plane keep-out per obstacle slot
+            for j in range(self.MAX_OBS):
+                constraints += [
+                    self._obs_n[j][k] @ self._states[:, k + 1]
+                    >= self._obs_safe[j][k] - self._slack[j][k]
+                ]
+                cost += self._slack_penalty * self._slack[j][k]
 
             cost += opt.quad_form(self._controls[:, k], self.r)
             if k == 0:
@@ -301,7 +322,78 @@ class DynamicBicycleMPC:
         return False
 
     # ------------------------------------------------------------------ #
-    def solve(self, initial_state, target, obstacle=None, max_iter=3, tolerance=1e-2):
+    def _decide_one(self, obstacle, x_ref, y_ref, psi_ref, lock_key):
+        """Decide pass-left / pass-right / stop for ONE obstacle.
+
+        Returns a decision dict. Uses self._obs_locks[lock_key] to commit to a
+        pass side so the choice can't flip mid-manoeuvre.
+        """
+        ox, oy, orad = obstacle[0], obstacle[1], obstacle[2]
+        ovx = obstacle[3] if len(obstacle) > 3 else 0.0
+        ovy = obstacle[4] if len(obstacle) > 4 else 0.0
+        keep = orad + self._vehicle_buffer
+        dref = np.hypot(x_ref - ox, y_ref - oy)
+        kstar = int(np.argmin(dref))
+        ths = psi_ref[kstar]
+        txs, tys = np.cos(ths), np.sin(ths)
+        lxs, lys = -np.sin(ths), np.cos(ths)
+        lateral_obs = (ox - x_ref[kstar]) * lxs + (oy - y_ref[kstar]) * lys
+        room_left = self._road_halfwidth - (lateral_obs + keep)
+        room_right = self._road_halfwidth + (lateral_obs - keep)
+        can_pass = max(room_left, room_right) >= 0.0
+
+        if not can_pass:
+            self._obs_locks.pop(lock_key, None)
+            pass_left = False
+        else:
+            if lock_key not in self._obs_locks:
+                self._obs_locks[lock_key] = (
+                    "pass_left" if room_left >= room_right else "pass_right")
+            pass_left = (self._obs_locks[lock_key] == "pass_left")
+
+        return dict(ox=ox, oy=oy, orad=orad, ovx=ovx, ovy=ovy, keep=keep,
+                    txs=txs, tys=tys, can_pass=can_pass, pass_left=pass_left)
+
+    def _fill_halfplane(self, decision, x_ref, y_ref, psi_ref):
+        """Build (obs_n[N,n], obs_safe[N]) keep-out half-planes for one decision.
+        A None decision -> trivially-satisfied (inactive) constraint."""
+        N, n = self.control_horizon, self.STATE_DIM
+        obs_n = np.zeros((N, n))
+        obs_safe = np.full(N, -1e6)
+        if decision is None:
+            obs_n[:, 0] = 1.0
+            return obs_n, obs_safe
+
+        ox, oy = decision["ox"], decision["oy"]
+        ovx, ovy, keep = decision["ovx"], decision["ovy"], decision["keep"]
+        can_pass, pass_left = decision["can_pass"], decision["pass_left"]
+        activation = decision["orad"] + self._pass_zone
+        for k in range(N):
+            oxk = ox + ovx * k * self.dt
+            oyk = oy + ovy * k * self.dt
+            thk = psi_ref[k + 1]
+            txk, tyk = np.cos(thk), np.sin(thk)
+            lxk, lyk = -np.sin(thk), np.cos(thk)
+            if not can_pass:
+                obs_n[k, 0], obs_n[k, 1] = -txk, -tyk
+                obs_safe[k] = -(txk * oxk + tyk * oyk) + keep
+                continue
+            s_gap = (x_ref[k + 1] - oxk) * txk + (y_ref[k + 1] - oyk) * tyk
+            if abs(s_gap) < activation:
+                if pass_left:
+                    obs_n[k, 0], obs_n[k, 1] = lxk, lyk
+                    obs_safe[k] = lxk * oxk + lyk * oyk + keep
+                else:
+                    obs_n[k, 0], obs_n[k, 1] = -lxk, -lyk
+                    obs_safe[k] = -(lxk * oxk + lyk * oyk) + keep
+            else:
+                obs_n[k, 0] = 1.0
+                obs_safe[k] = -1e6
+        return obs_n, obs_safe
+
+    # ------------------------------------------------------------------ #
+    def solve(self, initial_state, target, obstacle=None, obstacles=None,
+              max_iter=3, tolerance=1e-2, global_pose=None):
         """iMPC solve. target rows = [x_ref, y_ref, vx_ref, psi_ref] (ego frame).
 
         obstacle, if given, is (x, y, radius, vx, vy) in the EGO frame.
@@ -318,52 +410,60 @@ class DynamicBicycleMPC:
         x_ref, y_ref = np.array(target[0], float), np.array(target[1], float)
         vx_ref, psi_ref = np.array(target[2], float), target[3]
 
-        # ---- obstacle decision (done BEFORE building the reference) ----
+        # ---- normalize obstacles into a list (nearest first) ----
+        obs_list = []
+        if obstacles:
+            obs_list = list(obstacles)
+        elif obstacle is not None:
+            obs_list = [obstacle]
+        # sort by ego-frame distance (closest first), keep up to MAX_OBS
+        obs_list.sort(key=lambda o: float(np.hypot(o[0], o[1])))
+        obs_list = obs_list[:self.MAX_OBS]
+
         self._last_obstacle_action = "none"
-        decision = None
-        if obstacle is None:
-            self._obs_side_lock = None   # obstacle gone — release commitment
-        else:
-            ox, oy, orad, ovx, ovy = obstacle
-            keep = orad + self._vehicle_buffer
-            dref = np.hypot(x_ref - ox, y_ref - oy)
-            kstar = int(np.argmin(dref))
-            ths = psi_ref[kstar]
-            txs, tys = np.cos(ths), np.sin(ths)
-            lxs, lys = -np.sin(ths), np.cos(ths)
-            lateral_obs = (ox - x_ref[kstar]) * lxs + (oy - y_ref[kstar]) * lys
-            room_left = self._road_halfwidth - (lateral_obs + keep)
-            room_right = self._road_halfwidth + (lateral_obs - keep)
-            can_pass = max(room_left, room_right) >= 0.0
 
-            if not can_pass:
-                # No room — stop; also clear any stale lock
-                pass_left = False
-                self._obs_side_lock = None
+        # ---- decision per obstacle; nearest one drives stop / speed clamp ----
+        decisions = []
+        active_keys = set()
+        for j, ob in enumerate(obs_list):
+            
+            # FIX 1: Convert obstacle to global coordinates so the lock is stable.
+            if global_pose is not None:
+                c_psi, s_psi = math.cos(global_pose[2]), math.sin(global_pose[2])
+                ox_g = global_pose[0] + float(ob[0]) * c_psi - float(ob[1]) * s_psi
+                oy_g = global_pose[1] + float(ob[0]) * s_psi + float(ob[1]) * c_psi
+                key = (round(ox_g / 3.0), round(oy_g / 3.0))
             else:
-                # Commitment: once a side is chosen, keep it until the obstacle
-                # leaves the sensor cone. Without this the pass-side can flip as
-                # the car swings off-centre, causing the oscillation / spinning.
-                if self._obs_side_lock is None:
-                    self._obs_side_lock = "pass_left" if (room_left >= room_right) else "pass_right"
-                pass_left = (self._obs_side_lock == "pass_left")
+                key = (round(float(ob[0]) / 3.0), round(float(ob[1]) / 3.0))
+                
+            active_keys.add(key)
+            dec = self._decide_one(ob, x_ref, y_ref, psi_ref, key)
+            decisions.append(dec)
+        # release locks for obstacles no longer present
+        for k_ in list(self._obs_locks.keys()):
+            if k_ not in active_keys:
+                self._obs_locks.pop(k_, None)
+        if not obs_list:
+            self._obs_locks.clear()
+        self._obs_side_lock = None  # legacy field kept for callers; unused here
 
-            decision = dict(ox=ox, oy=oy, orad=orad, ovx=ovx, ovy=ovy, keep=keep,
-                            txs=txs, tys=tys, can_pass=can_pass, pass_left=pass_left)
+        if decisions:
+            nearest = decisions[0]
             self._last_obstacle_action = (
-                ("pass_left" if pass_left else "pass_right") if can_pass else "stop")
-
-            if not can_pass:
-                # Stop: clamp the position reference to a stop line behind the
-                # obstacle and zero the speed target, so the controller brakes
-                # to a halt instead of fighting a forward-pulling reference.
+                ("pass_left" if nearest["pass_left"] else "pass_right")
+                if nearest["can_pass"] else "stop")
+            if not nearest["can_pass"]:
+                # Stop: clamp position reference to a stop line behind the
+                # nearest obstacle and zero the speed target.
+                ox, oy = nearest["ox"], nearest["oy"]
+                txs, tys, keep = nearest["txs"], nearest["tys"], nearest["keep"]
                 stop_x = ox - txs * keep
                 stop_y = oy - tys * keep
                 for k in range(len(x_ref)):
                     s_k = (x_ref[k] - ox) * txs + (y_ref[k] - oy) * tys
-                    if s_k > -keep:                 # at/after the stop line
+                    if s_k > -keep:
                         x_ref[k], y_ref[k] = stop_x, stop_y
-                vx_ref = np.zeros_like(vx_ref)       # target speed 0 -> stop
+                vx_ref = np.zeros_like(vx_ref)
 
         cos_v, sin_v = np.cos(psi_ref), np.sin(psi_ref)
         along_ref = cos_v * x_ref + sin_v * y_ref
@@ -384,41 +484,13 @@ class DynamicBicycleMPC:
                 [along_ref[k], cross_ref[k], vx_ref[k], psi_ref[k], 0.0, 0.0]
             )
 
-        obs_n = np.zeros((N, n))
-        obs_safe = np.zeros(N)
-        if decision is None:
-            obs_n[:, 0] = 1.0
-            obs_safe[:] = -1e6
-        else:
-            ox, oy = decision["ox"], decision["oy"]
-            ovx, ovy, keep = decision["ovx"], decision["ovy"], decision["keep"]
-            can_pass, pass_left = decision["can_pass"], decision["pass_left"]
-            activation = decision["orad"] + self._pass_zone
+        # fill each obstacle slot's half-plane; unused slots are inactive
+        for j in range(self.MAX_OBS):
+            dec = decisions[j] if j < len(decisions) else None
+            obs_n_j, obs_safe_j = self._fill_halfplane(dec, x_ref, y_ref, psi_ref)
             for k in range(N):
-                oxk = ox + ovx * k * self.dt
-                oyk = oy + ovy * k * self.dt
-                thk = psi_ref[k + 1]
-                txk, tyk = np.cos(thk), np.sin(thk)        # road tangent
-                lxk, lyk = -np.sin(thk), np.cos(thk)       # left normal
-                if not can_pass:
-                    # stay behind: t.pos <= t.obs - keep  (brakes to a stop)
-                    obs_n[k, 0], obs_n[k, 1] = -txk, -tyk
-                    obs_safe[k] = -(txk * oxk + tyk * oyk) + keep
-                    continue
-                s_gap = (x_ref[k + 1] - oxk) * txk + (y_ref[k + 1] - oyk) * tyk
-                if abs(s_gap) < activation:               # alongside -> push aside
-                    if pass_left:
-                        obs_n[k, 0], obs_n[k, 1] = lxk, lyk
-                        obs_safe[k] = lxk * oxk + lyk * oyk + keep
-                    else:
-                        obs_n[k, 0], obs_n[k, 1] = -lxk, -lyk
-                        obs_safe[k] = -(lxk * oxk + lyk * oyk) + keep
-                else:                                     # clear -> inactive
-                    obs_n[k, 0] = 1.0
-                    obs_safe[k] = -1e6
-        for k in range(N):
-            self._obs_n[k].value = obs_n[k]
-        self._obs_safe.value = obs_safe
+                self._obs_n[j][k].value = obs_n_j[k]
+            self._obs_safe[j].value = obs_safe_j
 
         # warm-start guess for the iMPC loop
         if self._prev_traj is not None and self._prev_u is not None:
@@ -427,8 +499,14 @@ class DynamicBicycleMPC:
             u_guess = np.roll(self._prev_u, -1, axis=1)
             u_guess[:, -1] = self._prev_u[:, -1]
         else:
-            x_guess = np.tile(np.asarray(initial_state, dtype=float).reshape(n, 1),
-                              (1, N + 1))
+            # FIX 2: Shift the geometric path so it starts exactly at the car's 
+            # current position (0,0 in ego frame). This stops the solver from 
+            # crashing if the car is pushed far off the reference line.
+            x_guess = np.zeros((n, N + 1))
+            x_guess[0, :] = x_ref - x_ref[0]
+            x_guess[1, :] = y_ref - y_ref[0]
+            x_guess[2, :] = psi_ref
+            x_guess[3, :] = vx_ref
             u_guess = np.zeros((self.CONTROL_DIM, N))
 
         new_x = new_u = None
@@ -496,23 +574,49 @@ def _nn_idx(state, path) -> int:
 
 
 def get_ref_trajectory(state, path, target_v, T, DT, ego_frame: bool = True):
-    """Sample a (4, K+1) reference [x, y, vx, psi] over the horizon.
-
-    `state` here is the GLOBAL pose [x, y, psi, ...]; only x,y,psi are used.
-    """
+    """Sample a (4, K+1) reference [x, y, vx, psi] over the horizon."""
     K = int(T / DT)
     xref = np.zeros((4, K + 1))
     pose = np.array([state[0], state[1], state[2]])  # x, y, psi
     ind = _nn_idx(pose, path)
+    
+    # --- FIX: RECOVERY MODE ---
+    # Calculate how far off the road the car currently is.
+    dx = pose[0] - path[0, ind]
+    dy = pose[1] - path[1, ind]
+    cross_err = math.hypot(dx, dy)
+    
+    # If pushed far off the path, throttle the ghost car's target speed.
+    # This prevents the solver from dying by giving it time to steer 
+    # back to the road gently.
+    if cross_err > 1.5:
+        target_v = min(target_v, 2.5)
+    # --------------------------
+
     cdist = np.append([0.0], np.cumsum(np.hypot(np.diff(path[0]), np.diff(path[1]))))
     start = cdist[ind]
-    pts = [d * DT * target_v + start for d in range(K + 1)]
+
+    # FIX 1: Generate a dynamically feasible distance profile.
+    v_curr = state[3]
+    pts = [start]
+    s_ref = start
+    v_ref = v_curr
+    v_profile = [v_curr]
+
+    for _ in range(K):
+        if v_ref < target_v:
+            v_ref = min(target_v, v_ref + 3.0 * DT)  # smooth acceleration limit
+        elif v_ref > target_v:
+            v_ref = max(target_v, v_ref - 5.0 * DT)  # smooth braking limit
+        
+        s_ref += max(0.0, v_ref) * DT
+        pts.append(s_ref)
+        v_profile.append(max(0.0, v_ref))
+
     xref[0] = np.interp(pts, cdist, path[0])
     xref[1] = np.interp(pts, cdist, path[1])
-    xref[2] = target_v
+    xref[2] = np.array(v_profile)
     xref[3] = np.interp(pts, cdist, path[2])
-    reached = np.where(np.interp(pts, cdist, cdist) >= cdist[-1] - 1e-9)
-    xref[2, reached] = 0.0
 
     if ego_frame:
         dx = xref[0] - pose[0]
@@ -541,16 +645,16 @@ class AdaptiveSpeed:
     Gives the MPC human-like speed behaviour by modulating the target speed
     reference based on what a driver would naturally do:
 
-      1. OBSTACLE APPROACH  — smooth deceleration as an obstacle enters sensor
+      1. OBSTACLE APPROACH  - smooth deceleration as an obstacle enters sensor
          range, proportional to proximity. Braking starts at obs_brake_start
          metres and reaches v_min at obs_brake_end metres.
 
-      2. CORNER SLOWDOWN — looks ahead lookahead_s metres along the path,
+      2. CORNER SLOWDOWN - looks ahead lookahead_s metres along the path,
          finds the tightest curvature, and sets a speed limit so lateral
          acceleration stays within a_lat_comfort. Speed rises automatically on
          straights and drops into corners, exactly like a driver reading ahead.
 
-      3. SMOOTH TRANSITIONS — a first-order low-pass filter (time-constant tau)
+      3. SMOOTH TRANSITIONS - a first-order low-pass filter (time-constant tau)
          prevents sudden speed jumps; the car accelerates and brakes gradually.
 
     Usage (replaces constant target_v in the main loop):
@@ -562,11 +666,11 @@ class AdaptiveSpeed:
     def __init__(
         self,
         base_speed:      float = 11.0,
-        a_lat_comfort:   float =  4.5,   # m/s^2 comfortable lateral accel
+        a_lat_comfort:   float =  4.5,   # m/s^2 comfortable lateral accel (CARLA passes 1.5)
         lookahead_s:     float = 25.0,   # metres to scan ahead for corners
         obs_brake_start: float = 35.0,   # metres: start braking for obstacle
         obs_brake_end:   float =  5.0,   # metres: v_min reached here
-        v_min:           float =  4.0,   # m/s: ~14 km/h — keeps 12 m of MPC horizon
+        v_min:           float =  4.0,   # m/s: ~14 km/h - keeps 12 m of MPC horizon
         tau:             float =  1.2,   # s: smoothing time constant
     ):
         self.base            = base_speed
@@ -626,3 +730,62 @@ class AdaptiveSpeed:
 
     def set_base(self, speed: float):
         self.base = speed
+
+# ============================================================================ #
+#  Config-driven factories: one place that maps config.py to the constructors,
+#  so every entry point (sim, viewers, CARLA) builds the controller and speed
+#  governor identically from the central config. All values use getattr with the
+#  controller's own defaults as fallback, so an older/trimmed config still works.
+# ============================================================================ #
+def build_mpc(C, dt=None, horizon_time=None):
+    """Construct a DynamicBicycleMPC from a config module C."""
+    p = CarParams()
+    for k, v in C.CAR.items():
+        setattr(p, k, v)
+    return DynamicBicycleMPC(
+        params=p,
+        dt=dt if dt is not None else C.DT,
+        horizon_time=horizon_time if horizon_time is not None else C.HORIZON_TIME,
+        max_speed=getattr(C, "MAX_SPEED", 30.0),
+        max_acc=getattr(C, "MAX_ACC", 4.0),
+        max_d_acc=getattr(C, "MAX_D_ACC", 6.0),
+        max_steer=getattr(C, "MAX_STEER", 0.5),
+        max_d_steer=getattr(C, "MAX_D_STEER", 0.6),
+        state_cost=getattr(C, "STATE_COST", (5, 150, 8, 40, 2, 2)),
+        final_state_cost=getattr(C, "FINAL_STATE_COST", (5, 80, 8, 40, 2, 2)),
+        input_cost=getattr(C, "INPUT_COST", (1, 5)),
+        input_rate_cost=getattr(C, "INPUT_RATE_COST", (1, 250)),
+        safety_margin=getattr(C, "OBSTACLE_SAFETY_MARGIN", 1.0),
+        slack_penalty=getattr(C, "SLACK_PENALTY", 1e5),
+        road_halfwidth=getattr(C, "ROAD_HALFWIDTH", 5.0),
+        pass_zone=getattr(C, "PASS_ZONE", 6.0),
+    )
+
+
+def build_adaptive_speed(C, base_speed=None, carla=False):
+    """Construct an AdaptiveSpeed governor from a config module C.
+
+    carla=True selects the CARLA-specific tuning (separate from the pygame
+    values) so the two front-ends can behave differently.
+    """
+    if carla:
+        return AdaptiveSpeed(
+            base_speed=base_speed if base_speed is not None
+            else getattr(C, "CARLA_TARGET_SPEED", 7.0),
+            a_lat_comfort=getattr(C, "CARLA_A_LAT_COMFORT", 1.5),
+            lookahead_s=getattr(C, "ADAPT_LOOKAHEAD", 25.0),
+            obs_brake_start=getattr(C, "CARLA_OBS_BRAKE_START", 25.0),
+            obs_brake_end=getattr(C, "CARLA_OBS_BRAKE_END", 5.0),
+            v_min=getattr(C, "CARLA_V_MIN", 3.0),
+            tau=getattr(C, "ADAPT_TAU", 1.2),
+        )
+    return AdaptiveSpeed(
+        base_speed=base_speed if base_speed is not None
+        else getattr(C, "TARGET_SPEED", 11.0),
+        a_lat_comfort=getattr(C, "ADAPT_A_LAT_COMFORT", 4.5),
+        lookahead_s=getattr(C, "ADAPT_LOOKAHEAD", 25.0),
+        obs_brake_start=getattr(C, "ADAPT_OBS_BRAKE_START", 35.0),
+        obs_brake_end=getattr(C, "ADAPT_OBS_BRAKE_END", 5.0),
+        v_min=getattr(C, "ADAPT_V_MIN", 4.0),
+        tau=getattr(C, "ADAPT_TAU", 1.2),
+    )
