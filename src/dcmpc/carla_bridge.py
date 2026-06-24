@@ -36,6 +36,7 @@ from dcmpc.controller import (
     compute_path_from_wp, get_ref_trajectory, _nn_idx,
     AdaptiveSpeed, build_mpc, build_adaptive_speed,
 )
+from dcmpc.planner import plan_safe_path
 
 # ── settings ──────────────────────────────────────────────────────────
 # Connection
@@ -70,9 +71,16 @@ def setup_logging(level):
 
 
 class TraceWriter:
-    FIELDS = ["t", "x", "y", "psi_deg", "vx", "vy", "yaw_rate_deg",
+    FIELDS = ["t", "wall_t", "x", "y", "psi_deg", "vx", "vy", "yaw_rate_deg",
               "cross_track_m", "heading_err_deg", "mpc_a", "mpc_delta_deg",
-              "throttle", "brake", "steer", "solve_ms", "braked", "obstacle"]
+              "throttle", "brake", "steer", "solve_ms", "braked", "obstacle",
+              # speed-governor diagnostics
+              "adaptive_v", "speed_reason", "n_obs", "obs_dist",
+              # SYNC diagnostics: which LiDAR frame fed this control tick
+              "world_frame", "lidar_frame", "frame_lag", "lidar_age_ms",
+              # per-stage wall-clock timing [ms]
+              "tick_ms", "lidar_ms", "track_ms", "filter_ms", "speed_ms",
+              "plan_ms", "ref_ms", "apply_ms", "loop_ms"]
 
     def __init__(self, path):
         self.enabled = path is not None
@@ -167,11 +175,20 @@ def attach_lidar(world, vehicle):
     mount_z = float(getattr(C, "CARLA_LIDAR_MOUNT_Z", 2.4))
     tf = carla.Transform(carla.Location(x=0.0, z=mount_z))
     sensor = world.spawn_actor(bp, tf, attach_to=vehicle)
-    buf = {"pts": np.empty((0, 3), dtype=np.float32)}
+    buf = {"pts": np.empty((0, 3), dtype=np.float32),
+           "frame": -1, "stamp": 0.0, "recv": 0.0}
 
     def _on_scan(scan):
         raw = np.frombuffer(scan.raw_data, dtype=np.float32).reshape(-1, 4)
         buf["pts"] = raw[:, :3].copy()
+        # SYNC instrumentation: remember which simulation frame this scan came
+        # from, the sim timestamp it carries, and the wall-clock instant the
+        # callback actually delivered it. Comparing buf["frame"] to the world
+        # snapshot frame in the loop reveals whether the control tick is acting
+        # on a stale (previous-frame) cloud.
+        buf["frame"] = scan.frame
+        buf["stamp"] = scan.timestamp
+        buf["recv"] = time.time()
     sensor.listen(_on_scan)
     return sensor, buf
 
@@ -270,6 +287,7 @@ def lidar_obstacles(
     ego_exclusion=4.5,
     max_range=45.0,
     max_radius=3.5,
+    fixed_radius=1.5,
     debug=False,
 ):
     """
@@ -375,26 +393,33 @@ def lidar_obstacles(
 
     # 6) Cluster -> circular obstacle
     obs = []
+    # a single detected vehicle is given ONE stable radius for the keep-out,
+    # rather than the raw LiDAR spread. The spread breathes every tick with the
+    # viewing angle (the LiDAR sees the back bumper one tick, the long side the
+    # next), which made the keep-out half-plane jump and the car swerve wide.
+    # The spread is still used below to REJECT oversized scenery, but the radius
+    # fed downstream is fixed and calm.
+    stable_r = float(fixed_radius)
+
     for comp in clusters:
         cx = float(np.mean(comp[:, 0]))
         cy = float(np.mean(comp[:, 1]))
 
         spread = float(np.max(np.hypot(comp[:, 0] - cx, comp[:, 1] - cy)))
-        r = max(spread, 0.3)
 
-        # --- FIX: PERCEPTION SANITY CHECKS ---
+        # --- PERCEPTION SANITY CHECKS (use raw spread to reject scenery) ---
         # 1. Reject massive objects (buildings, long hedges, walls).
-        # Passenger cars are ~1.5m-2.0m in radius. 
-        if r > max_radius:
+        if spread > max_radius:
             continue
-            
+
         # 2. Reject objects far off the lateral center of the road.
         # This prevents sidewalks and parked scenery from triggering avoidance.
         if abs(cy) > 8.0:
             continue
         # -------------------------------------
 
-        obs.append((cx, cy, r, 0.0, 0.0))
+        # emit the STABLE radius (not the breathing spread) for the keep-out
+        obs.append((cx, cy, stable_r, 0.0, 0.0))
 
     obs.sort(key=lambda o: math.hypot(o[0], o[1]))
     obs = obs[:max_obs]
@@ -496,6 +521,20 @@ def spawn_obstacle(world, path, base_z, along=60.0, offset=1.8):
 
 # ── main ──────────────────────────────────────────────────────────────
 
+def _resolve_output_dir():
+    """Return (and create) the folder where trace files are written.
+
+    Defaults to an 'output' folder in the current working directory (where you
+    launch dcmpc-carla), e.g. .\\output\\. Override with CARLA_OUTPUT_DIR in
+    config (absolute, or relative to the working directory).
+    """
+    import os
+    out = getattr(C, "CARLA_OUTPUT_DIR", "output")
+    out = os.path.abspath(out)
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--debug", action="store_true")
@@ -517,14 +556,35 @@ def main():
         log.error("'carla' package not found.  pip install carla")
         sys.exit(1)
 
-    trace = TraceWriter(None if args.no_csv
-                        else f"carla_trace_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    if args.no_csv:
+        trace = TraceWriter(None)
+    else:
+        import os
+        out_dir = _resolve_output_dir()
+        trace_path = os.path.join(
+            out_dir, f"carla_trace_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        trace = TraceWriter(trace_path)
 
     log.info("Car params: %s", C.CAR)
     log.info("Target speed %.1f m/s (%.0f km/h), dt %.3f s, horizon %.1f s.",
              CARLA_TARGET_SPEED, CARLA_TARGET_SPEED * 3.6, TICK_DT, C.HORIZON_TIME)
     mpc = build_mpc(C, dt=TICK_DT)
     speed_ctrl = build_adaptive_speed(C, base_speed=CARLA_TARGET_SPEED, carla=True)
+
+    # Obstacle tracker (perception-only; stabilises the raw LiDAR obstacle list).
+    tracker = None
+    if getattr(C, "CARLA_TRACKER_ENABLE", True):
+        from dcmpc.tracker import ObstacleTracker
+        tracker = ObstacleTracker(
+            dt=TICK_DT,
+            gate=getattr(C, "CARLA_TRACKER_GATE", 3.0),
+            q_accel=getattr(C, "CARLA_TRACKER_Q_ACCEL", 4.0),
+            meas_var=getattr(C, "CARLA_TRACKER_MEAS_VAR", 0.25),
+            confirm_hits=getattr(C, "CARLA_TRACKER_CONFIRM", 2),
+            max_misses=getattr(C, "CARLA_TRACKER_MAX_MISS", 5))
+        log.info("Obstacle tracker ON (Kalman, gate=%.1fm, coast=%d ticks).",
+                 getattr(C, "CARLA_TRACKER_GATE", 3.0),
+                 getattr(C, "CARLA_TRACKER_MAX_MISS", 5))
 
     log.info("Connecting to CARLA at %s:%d ...", CARLA_HOST, CARLA_PORT)
     client = carla.Client(CARLA_HOST, CARLA_PORT)
@@ -623,14 +683,36 @@ def main():
     tick = brakes = 0
     worst_cross = solve_ms_sum = 0.0
     min_obs_gap = 1e18
+    # Graceful solve-failure handling: instead of slamming the emergency brake
+    # the instant a solve returns None (which removes the very speed the MPC
+    # needs to steer back, stalling the car), reuse the last good command for a
+    # few ticks. A genuine brake only fires if the solver keeps failing past
+    # that window.
+    last_good_controls = None
+    held = 0
+    HOLD_MAX = getattr(C, "CARLA_SOLVE_HOLD_TICKS", 3)
 
     try:
         log.info("Running MPC loop. Ctrl-C to stop.")
+        if getattr(C, "USE_PATH_PLANNER", False):
+            from dcmpc.planner import reset_planner_memory
+            reset_planner_memory()
         while True:
+            _loop0 = time.perf_counter()
+            wall_t = time.time()
+            _t = time.perf_counter()
             world.tick()
+            tick_ms = (time.perf_counter() - _t) * 1000.0
+            world_frame = world.get_snapshot().frame
             tick += 1
             state = carla_state(vehicle)
             set_spectator(world, vehicle)
+            # per-stage timers (set as each stage runs; default 0 if skipped)
+            lidar_ms = track_ms = filter_ms = speed_ms = plan_ms = ref_ms = apply_ms = 0.0
+            lidar_frame = lidar_buf["frame"] if lidar_buf is not None else -1
+            frame_lag = (world_frame - lidar_frame) if lidar_frame >= 0 else -1
+            lidar_age_ms = ((wall_t - lidar_buf["recv"]) * 1000.0
+                            if lidar_buf is not None and lidar_buf["recv"] > 0 else 0.0)
 
             if np.hypot(state[0] - path[0, -1], state[1] - path[1, -1]) < 5.0:
                 log.info("Reached end of route after %d ticks.", tick)
@@ -640,6 +722,7 @@ def main():
             worst_cross = max(worst_cross, abs(cross))
 
             if lidar_buf is not None:
+                _t = time.perf_counter()
                 obs_list = lidar_obstacles(
                     lidar_buf["pts"], max_obs=mpc.MAX_OBS,
                     z_min=getattr(C, "LIDAR_Z_MIN", -1.2),
@@ -649,7 +732,16 @@ def main():
                     fov_deg=getattr(C, "LIDAR_FOV_DEG", 90.0),
                     ego_exclusion=getattr(C, "LIDAR_EGO_EXCLUSION", 4.5),
                     max_range=getattr(C, "LIDAR_MAX_RANGE", 45.0),
-                    max_radius=getattr(C, "LIDAR_MAX_RADIUS", 3.5))
+                    max_radius=getattr(C, "LIDAR_MAX_RADIUS", 3.5),
+                    fixed_radius=getattr(C, "CARLA_OBSTACLE_RADIUS", 1.5))
+                lidar_ms = (time.perf_counter() - _t) * 1000.0
+                # Stabilise the raw detections: persistent identity, smoothed
+                # position, estimated velocity, brief coasting through dropouts.
+                # Same tuple format, so everything downstream is unchanged.
+                if tracker is not None:
+                    _t = time.perf_counter()
+                    obs_list = tracker.update(obs_list)
+                    track_ms = (time.perf_counter() - _t) * 1000.0
                 ego_obs = obs_list[0] if obs_list else None
                 if lidar_view is not None:
                     lidar_view.update(
@@ -673,11 +765,14 @@ def main():
             if ego_obs is not None:
                 gap = math.hypot(ego_obs[0], ego_obs[1]) - ego_obs[2]
                 min_obs_gap = min(min_obs_gap, gap)
-            adaptive_v = speed_ctrl.update(state, path, ego_obs, TICK_DT)
+            # NOTE: adaptive speed is computed once below, AFTER filtering, using
+            # the clean obstacle list - so a scenery cluster can't trigger a
+            # phantom slowdown and a flickering detection can't surge the speed.
             # 1. Generate a rough path prediction using CURRENT speed to filter scenery
             rough_target = get_ref_trajectory(state, path, state[3], C.HORIZON_TIME, TICK_DT, ego_frame=True)
 
             # 2. Path-based scenery filter & bumper guard (all tunable in config)
+            _t = time.perf_counter()
             _cap_r   = getattr(C, "CARLA_OBSTACLE_RADIUS_CAP", 1.5)
             _bg_back = getattr(C, "CARLA_BUMPER_GUARD_BACK", -8.0)
             _bg_front= getattr(C, "CARLA_BUMPER_GUARD_FRONT", 2.0)
@@ -703,62 +798,86 @@ def main():
                         filtered_obs.append(ob)
 
             obs_list = filtered_obs
+            filter_ms = (time.perf_counter() - _t) * 1000.0
 
             # 3. NOW calculate adaptive speed using the CLEAN obstacle list
             clean_ego_obs = obs_list[0] if obs_list else None
+            _t = time.perf_counter()
             adaptive_v = speed_ctrl.update(state, path, clean_ego_obs, TICK_DT)
+            speed_ms = (time.perf_counter() - _t) * 1000.0
 
-            # 4. Generate the actual target trajectory for the MPC solver
-            # Notice we completely removed the manual Y-bending!
-            target = get_ref_trajectory(state, path, adaptive_v, C.HORIZON_TIME, TICK_DT, ego_frame=True)
-            
+            # 4. Generate the actual target trajectory for the MPC solver.
+            #    DECOUPLED MODE: if the kinematic planner is enabled, bend the
+            #    PATH around obstacles here (Layer 1) and let the dynamic MPC
+            #    track that already-safe path with NO obstacle constraint. This
+            #    avoids the QP infeasibility that came from solving avoidance and
+            #    dynamics in one problem.
+            if getattr(C, "USE_PATH_PLANNER", False):
+                _t = time.perf_counter()
+                safe_path, plan_blocked = plan_safe_path(path, obs_list, state, C)
+                plan_ms = (time.perf_counter() - _t) * 1000.0
+                _t = time.perf_counter()
+                target = get_ref_trajectory(state, safe_path, adaptive_v,
+                                            C.HORIZON_TIME, TICK_DT, ego_frame=True)
+                ref_ms = (time.perf_counter() - _t) * 1000.0
+                solve_obstacles = None          # tracker does NOT see obstacles
+            else:
+                _t = time.perf_counter()
+                target = get_ref_trajectory(state, path, adaptive_v,
+                                            C.HORIZON_TIME, TICK_DT, ego_frame=True)
+                ref_ms = (time.perf_counter() - _t) * 1000.0
+                solve_obstacles = obs_list      # old single-QP behaviour
+                plan_blocked = False
+
             ego_state = np.array([0., 0., 0., state[3], state[4], state[5]])
             
-            
-           
 
-            # ── DEBUG: WHAT THE CAR SEES ──────────────────────────────────────
-            # Print every 5 ticks (~0.5s) to keep the terminal readable, 
-            # or force print if the solver just failed on the previous tick.
-            if tick % 5 == 0 or brakes > 0: 
-                obs_msg = "None in range"
-                if obs_list and obs_list[0] is not None:
-                    o = obs_list[0]
-                    odist = math.hypot(o[0], o[1])
-                    obs_msg = f"x={o[0]:.1f}, y={o[1]:.1f} (dist={odist:.1f}m, r={o[2]:.1f}m)"
-                
-                log.info(
-                    "\n"
-                    "  [VISION @ tick %d]\n"
-                    "  | Ego Vx    : %.2f m/s\n"
-                    "  | Target V  : %.2f m/s (Reason: %s)\n"
-                    "  | Path End  : x=%.1f, y=%.1f [Ego Frame]\n"
-                    "  | Obstacle  : %s",
-                    tick, state[3], adaptive_v, getattr(speed_ctrl, 'reason', 'N/A'),
-                    target[0, -1], target[1, -1], obs_msg
-                )
+            # ── prepare a compact obstacle description; the full status line is
+            #    printed after the solve so it can include steer + solve time. ──
+            obs_msg = "clear"
+            if obs_list and obs_list[0] is not None:
+                o = obs_list[0]
+                odist = math.hypot(o[0], o[1])
+                side = "R" if o[1] < 0 else "L"
+                obs_msg = f"{odist:4.1f}m {side}"
             # ──────────────────────────────────────────────────────────────────
 
-           
-            
             t_solve = time.time()
             # Pass the global 'state' into global_pose
-            traj, controls = mpc.solve(ego_state, target, obstacles=obs_list, max_iter=getattr(C, "MPC_MAX_ITER", 3), global_pose=state)
+            traj, controls = mpc.solve(ego_state, target, obstacles=solve_obstacles, max_iter=getattr(C, "MPC_MAX_ITER", 3), global_pose=state)
             solve_ms = (time.time() - t_solve) * 1000.0
             solve_ms_sum += solve_ms
-            braked = traj is None
-            if braked:
-                brakes += 1
-                log.warning("tick %d: EMERGENCY BRAKE (cross=%.2f, vx=%.1f).",
-                            tick, cross, state[3])
+
+            # ── Graceful degradation on solver failure ──────────────────────
+            # A None trajectory means the QP failed to converge (typically a
+            # low-speed, off-path recovery where lateral authority is near zero).
+            # Emergency-braking there is counter-productive: it stops the car,
+            # and from a standstill the next solve is even harder, so the car
+            # stalls. Hold the last good command for up to HOLD_MAX ticks to let
+            # speed (and thus steering authority) build; only brake for real if
+            # the solver keeps failing past that window.
+            solve_failed = traj is None
+            held_now = False
+            if solve_failed:
+                if last_good_controls is not None and held < HOLD_MAX:
+                    controls = last_good_controls
+                    held += 1
+                    held_now = True
+                else:
+                    brakes += 1            # genuine emergency brake
+            else:
+                last_good_controls = controls
+                held = 0
+            braked = solve_failed and not held_now
+            # ────────────────────────────────────────────────────────────────
 
             a, delta = controls[:, 0]
+            _t = time.perf_counter()
             ctrl = acc_to_control(a, state[3])
             ctrl.steer = steer_to_control(delta, max_steer)
             vehicle.apply_control(ctrl)
-
-            if abs(cross) > 4.0:
-                log.warning("tick %d: large cross-track %.2f m.", tick, cross)
+            apply_ms = (time.perf_counter() - _t) * 1000.0
+            loop_ms = (time.perf_counter() - _loop0) * 1000.0
 
             log.debug("t=%.2f cross=%+.2f herr=%+.1f a=%+.2f d=%+.1f "
                       "thr=%.2f brk=%.2f steer=%+.2f obs=%s solve=%.0fms",
@@ -766,8 +885,11 @@ def main():
                       math.degrees(delta), ctrl.throttle, ctrl.brake,
                       ctrl.steer, "Y" if ego_obs else "-", solve_ms)
 
+            _odist = (math.hypot(clean_ego_obs[0], clean_ego_obs[1])
+                      if clean_ego_obs is not None else "")
             trace.row(
-                t=round(tick * TICK_DT, 3), x=round(state[0], 2), y=round(state[1], 2),
+                t=round(tick * TICK_DT, 3), wall_t=round(wall_t, 4),
+                x=round(state[0], 2), y=round(state[1], 2),
                 psi_deg=round(math.degrees(state[2]), 1), vx=round(state[3], 2),
                 vy=round(state[4], 3), yaw_rate_deg=round(math.degrees(state[5]), 2),
                 cross_track_m=round(cross, 3), heading_err_deg=round(math.degrees(herr), 2),
@@ -775,15 +897,50 @@ def main():
                 throttle=round(ctrl.throttle, 3), brake=round(ctrl.brake, 3),
                 steer=round(ctrl.steer, 3), solve_ms=round(solve_ms, 1),
                 braked=int(braked), obstacle=int(ego_obs is not None),
+                adaptive_v=round(float(adaptive_v), 2),
+                speed_reason=getattr(speed_ctrl, "reason", ""),
+                n_obs=len(obs_list), obs_dist=(round(_odist, 2) if _odist != "" else ""),
+                world_frame=world_frame, lidar_frame=lidar_frame,
+                frame_lag=frame_lag, lidar_age_ms=round(lidar_age_ms, 1),
+                tick_ms=round(tick_ms, 1), lidar_ms=round(lidar_ms, 1),
+                track_ms=round(track_ms, 1), filter_ms=round(filter_ms, 1),
+                speed_ms=round(speed_ms, 1), plan_ms=round(plan_ms, 1),
+                ref_ms=round(ref_ms, 1), apply_ms=round(apply_ms, 1),
+                loop_ms=round(loop_ms, 1),
             )
 
-            if level <= logging.INFO and tick % 5 == 0:
+            # Per-stage timing / sync line on the console. Prints EVERY tick by
+            # default (full resolution for diagnosing a transient sync issue);
+            # set CARLA_LOG_TIMING=False in config to fall back to every 5 ticks.
+            # frame_lag is the key number: 0 = LiDAR cloud is from THIS sim frame
+            # (in sync); >=1 = the control tick is acting on a stale cloud.
+            _log_timing = getattr(C, "CARLA_LOG_TIMING", True)
+            if level <= logging.INFO and (_log_timing or tick % 5 == 0 or frame_lag > 0):
+                log.info(
+                    "  t=%5.1fs lag=%d (w%d/l%d) age=%4.0fms | ms: tick=%3.0f "
+                    "lidar=%3.0f track=%2.0f filt=%2.0f speed=%2.0f plan=%2.0f "
+                    "ref=%2.0f solve=%3.0f apply=%2.0f loop=%3.0f",
+                    tick * TICK_DT, frame_lag, world_frame, lidar_frame, lidar_age_ms,
+                    tick_ms, lidar_ms, track_ms, filter_ms, speed_ms,
+                    plan_ms, ref_ms, solve_ms, apply_ms, loop_ms,
+                )
+
+            if level <= logging.INFO and (tick % 5 == 0 or braked or held_now):
                 act = mpc._last_obstacle_action
-                log.info("t=%5.1fs | %5.1f km/h | cross %+.2f m | steer %+5.1f deg "
-                         "| %s | solve %3.0f ms",
-                         tick * TICK_DT, state[3] * 3.6, cross,
-                         math.degrees(delta),
-                         act.upper() if act != "none" else "   ", solve_ms)
+                act_str = {"pass_left": "<-pass", "pass_right": "pass->",
+                           "stop": " STOP "}.get(act, "      ")
+                reason = getattr(speed_ctrl, "reason", "")
+                flag = ("BRAKE" if braked else
+                        "HOLD" if held_now else
+                        ("WIDE" if abs(cross) > 2.0 else ""))
+                # one aligned row: time | speed | offset from path | steering |
+                #    what it's doing | nearest obstacle | why slow | solve | sync lag
+                log.info(
+                    "t=%5.1fs | %4.0f km/h | off %+5.2fm | steer %+5.1f | "
+                    "%s | obs %-7s | %-6s | %3.0fms lag=%d %s",
+                    tick * TICK_DT, state[3] * 3.6, cross, math.degrees(delta),
+                    act_str, obs_msg, reason, solve_ms, frame_lag, flag
+                )
 
     except KeyboardInterrupt:
         log.info("Interrupted by user.")

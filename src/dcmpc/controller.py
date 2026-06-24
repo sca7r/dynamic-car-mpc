@@ -136,7 +136,13 @@ class DynamicBicycleMPC:
         safety_margin: float = 0.5,
         slack_penalty: float = 1e5,
         road_halfwidth: float = 5.0,
-        
+        # Lateral corridor: cross-track error up to this many metres is penalty-
+        # FREE; only the excess beyond it is penalised (a soft deadband on the
+        # cross term). 0.0 = strict centreline tracking (exact old behaviour).
+        # Keep it well under road_halfwidth - obstacle clearance so the free band
+        # cannot let the car drift into an obstacle uncosted.
+        cross_band: float = 0.0,
+
         # FIX: Increase pass_zone from 6.0 to 18.0.
         # This prevents the MPC from looking past the obstacle and cutting in early.
         pass_zone: float = 18.0, 
@@ -162,6 +168,18 @@ class DynamicBicycleMPC:
         self.r = np.diag(input_cost)
         self._rr_sqrt = np.sqrt(np.asarray(input_rate_cost, dtype=float))
 
+        # Lateral corridor (soft deadband on cross-track). When cross_band > 0 we
+        # pull the cross weight OUT of the quadratic q and re-apply it only to the
+        # part of the cross error that exceeds the band, via a hinge slack. This
+        # keeps the problem convex and DPP. cross is state index 1.
+        self._cross_band = float(cross_band)
+        self._cross_w = float(state_cost[1])
+        self._cross_wf = float(final_state_cost[1])
+        if self._cross_band > 0.0:
+            # zero the cross term in the quadratic blocks; it is handled by hinge
+            self.q[1, 1] = 0.0
+            self.qf[1, 1] = 0.0
+
         self._slack_penalty = slack_penalty
         self._vehicle_buffer = self.width / 2.0 + safety_margin
 
@@ -175,6 +193,8 @@ class DynamicBicycleMPC:
         # one slack vector per obstacle slot
         self._slack = [opt.Variable(N, nonneg=True, name=f"slack{j}") for j in range(J)]
         self._err = opt.Variable((n, N + 1), name="track_error")
+        # hinge slack for the lateral corridor: cross_excess_k >= |err_cross_k| - band
+        self._cross_excess = opt.Variable(N + 1, nonneg=True, name="cross_excess")
 
         # --- parameters (all in Parameter-matrix @ Variable form for DPP) ---
         self._x0 = opt.Parameter(n, name="x0")
@@ -238,11 +258,19 @@ class DynamicBicycleMPC:
         cost = 0
         constraints = []
         N = self.control_horizon
+        use_band = self._cross_band > 0.0
 
         # err_k == M_k @ state_k - ref_k  (DPP-blessed parameter @ variable)
         for k in range(N + 1):
             constraints += [self._err[:, k] == self._M[k] @ self._states[:, k]
                             - self._ref[k]]
+            if use_band:
+                # cross_excess_k >= |err_cross_k| - band, cross_excess_k >= 0
+                # (so error within +/-band is free; only the excess is penalised)
+                constraints += [
+                    self._cross_excess[k] >= self._err[1, k] - self._cross_band,
+                    self._cross_excess[k] >= -self._err[1, k] - self._cross_band,
+                ]
 
         for k in range(N):
             constraints += [
@@ -252,6 +280,8 @@ class DynamicBicycleMPC:
                 + self._C[k]
             ]
             cost += opt.quad_form(self._err[:, k], self.q)
+            if use_band:
+                cost += self._cross_w * opt.square(self._cross_excess[k])
 
             # one soft half-plane keep-out per obstacle slot
             for j in range(self.MAX_OBS):
@@ -274,6 +304,8 @@ class DynamicBicycleMPC:
                 )
 
         cost += opt.quad_form(self._err[:, -1], self.qf)
+        if use_band:
+            cost += self._cross_wf * opt.square(self._cross_excess[-1])
 
         constraints += [self._states[:, 0] == self._x0]
         constraints += [opt.abs(self._states[3, :]) <= self.max_speed]   # |vx|
@@ -300,10 +332,12 @@ class DynamicBicycleMPC:
 
     # ------------------------------------------------------------------ #
     def _try_solve(self) -> bool:
-        """Solve robustly: CLARABEL warm -> CLARABEL cold -> OSQP. The QP can
-        occasionally fail numerically on a warm start near tight turns; a cold
-        re-solve or a second solver almost always recovers, which is gentler
-        than an emergency brake. Returns True if a usable solution was found."""
+        """Solve robustly: OSQP warm -> CLARABEL cold -> OSQP cold. OSQP warm-
+        started is the fast path (~70 ms); it can occasionally return an
+        inaccurate-but-usable solution, which we accept. A cold CLARABEL / OSQP
+        retry recovers the rare hard case. Returns True if a usable solution was
+        found. (Genuine failures are handled gracefully by the bridge, which
+        holds the last good command rather than emergency-braking.)"""
         attempts = [
             dict(solver=opt.OSQP, warm_start=True, enforce_dpp=True, polish=True,
                  eps_abs=1e-5, eps_rel=1e-5, max_iter=8000),
@@ -758,6 +792,7 @@ def build_mpc(C, dt=None, horizon_time=None):
         safety_margin=getattr(C, "OBSTACLE_SAFETY_MARGIN", 1.0),
         slack_penalty=getattr(C, "SLACK_PENALTY", 1e5),
         road_halfwidth=getattr(C, "ROAD_HALFWIDTH", 5.0),
+        cross_band=getattr(C, "CROSS_BAND", 0.0),
         pass_zone=getattr(C, "PASS_ZONE", 6.0),
     )
 

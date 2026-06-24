@@ -9,6 +9,34 @@ their numbers from this file, so this is the one place to tune and debug.
 Each setting documents: what it does, its units, a sensible RANGE, and which way
 to turn it. Values left alone keep the car driving exactly as shipped.
 
+--------------------------------------------------------------------------------
+ NEW HERE?  You do NOT need to read this whole file. Start with these five:
+--------------------------------------------------------------------------------
+   1. Just run it first - no edits needed:   dcmpc-sim --no-gif   (10 s, no GPU)
+   2. Want a different track?  edit  TRACK_X / TRACK_Y          (pygame)
+   3. Move/add obstacles?      edit  OBSTACLES (pygame) or CARLA_OBSTACLES (CARLA)
+   4. Car drives too fast/slow? edit TARGET_SPEED (pygame) or CARLA_TARGET_SPEED
+   5. Passing too close / too wide?  edit  OBSTACLE_SAFETY_MARGIN
+   Everything else has a safe default - leave it until you have a reason to change it.
+
+ THE ONE GOTCHA:  pygame and CARLA are tuned SEPARATELY.
+   - The pygame sim reads the ADAPT_* and TARGET_SPEED / OBSTACLES groups.
+   - The CARLA bridge reads the CARLA_* groups (CARLA_TARGET_SPEED, CARLA_V_MIN,
+     CARLA_OBSTACLES, ...) and IGNORES ADAPT_*.
+   So if you tune ADAPT_V_MIN and nothing changes in CARLA, that's why - use the
+   matching CARLA_* knob instead.
+
+ SECTION MAP (in file order):
+   ROAD / SPEED / OBSTACLES ............ pygame scenario          [beginner]
+   CAR PHYSICS ........................ shared vehicle model      [intermediate]
+   CONTROLLER LIMITS / COST WEIGHTS ... what the MPC may do & optimises [intermediate]
+   AVOIDANCE / PLANNER ................ how it routes round obstacles    [intermediate]
+   ADAPTIVE SPEED (ADAPT_*) ........... pygame speed behaviour    [beginner]
+   TIMING (DT, HORIZON_TIME) .......... control rate & look-ahead [advanced]
+   CARLA ............................. server, camera, speed, obstacles [beginner]
+   VIRTUAL LIDAR / TRACKER ............ CARLA perception tuning   [advanced]
+   Most people only ever touch the [beginner] groups.
+
 PYGAME vs CARLA: the pygame sim and the CARLA bridge are tuned differently
 (CARLA drives slower and more cautiously in town traffic). Where they differ,
 there are SEPARATE settings: the ADAPT_* group drives the pygame sim, and the
@@ -107,7 +135,7 @@ MAX_D_STEER = 0.6      # max steering rate.
 #    index 1 (steer-rate): raise to stop snappy/oscillating steering. RANGE 50..400.
 #  Bigger weight = the controller works harder to drive that term to zero.
 # ============================================================================ #
-STATE_COST       = (5, 150, 8, 40, 2, 2)
+STATE_COST       = (5, 150, 8, 40, 6, 2)
 FINAL_STATE_COST = (5,  80, 8, 40, 2, 2)
 INPUT_COST       = (1, 5)
 INPUT_RATE_COST  = (1, 250)
@@ -121,18 +149,46 @@ MPC_MAX_ITER = 3
 # ============================================================================ #
 #  OBSTACLE AVOIDANCE  (shared by sim and CARLA)
 # ============================================================================ #
-ROAD_HALFWIDTH         = 5.0   # drivable half-width used for the overtake-vs-stop
+ROAD_HALFWIDTH         = 4.0   # drivable half-width used for the overtake-vs-stop
                                # decision. units m. RANGE 3..7. Room on a side ->
                                # LANE-CHANGE; no room either side -> STOP behind.
-OBSTACLE_SAFETY_MARGIN = 1.0   # clearance kept from the obstacle surface.
+CROSS_BAND             = 0.7   # LATERAL CORRIDOR: cross-track error up to this many
+                               # metres is penalty-FREE; only the excess beyond it is
+                               # penalised. units m. RANGE 0.0..1.5. 0.0 = strict
+                               # centreline (old behaviour). This lets the car hold a
+                               # slight off-centre line (e.g. after starting to pass an
+                               # obstacle) instead of being snapped back to centre.
+                               # Keep WELL under ROAD_HALFWIDTH minus obstacle
+                               # clearance, or the free band can let the car drift
+                               # toward an obstacle uncosted. Start ~0.5.
+OBSTACLE_SAFETY_MARGIN = 0.2   # clearance kept from the obstacle surface.
                                # units m. RANGE 0.3..2.0. Raise -> passes wider /
                                # safer (may STOP if the lane is tight); lower ->
                                # passes closer.
-PASS_ZONE              = 6.0   # longitudinal keep-out distance past the obstacle,
+PASS_ZONE              = 1.5   # longitudinal keep-out distance past the obstacle,
                                # so the car does not cut back in too early.
                                # units m. RANGE 4..20. Raise if it clips the rear.
 SLACK_PENALTY          = 1e5   # how hard the soft keep-out constraint pushes back.
                                # units cost. RANGE 1e3..1e6. Advanced; rarely changed.
+
+# ============================================================================ #
+#  DECOUPLED PATH PLANNER  (Layer 1)
+#  When True, a kinematic planner bends the reference PATH around obstacles and
+#  the dynamic MPC tracks that already-safe path with NO obstacle constraint.
+#  This avoids the QP infeasibility (multi-second solver freezes / wide swerve)
+#  that happened when obstacle keep-out and vehicle dynamics fought in one QP.
+#  Set False to restore the old single-QP behaviour exactly (obstacle handled
+#  inside the MPC). See PLANNER_DESIGN.md.
+# ============================================================================ #
+USE_PATH_PLANNER       = True  # master toggle for the decoupled planner.
+PLANNER_RAMP_GAIN      = 3.0   # metres of bend ramp per metre of lateral shift.
+                               # Higher -> gentler, longer bend (starts avoiding
+                               # earlier). Lower -> sharper bend. RANGE 2..6.
+PLANNER_RAMP_MIN       = 6.0   # minimum bend ramp half-length, metres. RANGE 3..10.
+PLANNER_DECAY_TICKS    = 12    # after an obstacle is passed/lost, its path bend
+                               # lingers and decays over this many ticks so the
+                               # path ramps back to centre smoothly instead of
+                               # snapping (a snap stalled the car). RANGE 6..20.
 
 # ============================================================================ #
 #  ADAPTIVE SPEED  -  PYGAME SIM tuning (human-like speed modulation)
@@ -148,7 +204,7 @@ ADAPT_OBS_BRAKE_START = 35.0   # distance at which braking for an obstacle begin
                                # units m. RANGE 15..50.
 ADAPT_OBS_BRAKE_END   = 5.0    # distance at which the speed floor is reached.
                                # units m. RANGE 2..10. Must be < ADAPT_OBS_BRAKE_START.
-ADAPT_V_MIN           = 4.0    # slowest creep speed near obstacles/corners.
+ADAPT_V_MIN           = 2.0    # slowest creep speed near obstacles/corners.
                                # units m/s. RANGE 1..6. Keep high enough that the
                                # MPC horizon still covers a close obstacle
                                # (about ADAPT_V_MIN * HORIZON_TIME metres).
@@ -181,6 +237,10 @@ CARLA_SPECTATOR_HEIGHT= 40.0    # camera height above the car for the top-down
 CARLA_CREEP_THROTTLE  = 0.4     # throttle applied to pull away from a near-stop
                                 # (below 0.5 m/s). units 0..1. RANGE 0.2..0.6.
                                 # Higher = pulls away faster from rest.
+CARLA_OUTPUT_DIR      = "output"  # folder for CSV trace files. Relative paths are
+                                  # resolved against the working directory where
+                                  # you launch dcmpc-carla (created if missing);
+                                  # an absolute path is used as-is.
 
 # ============================================================================ #
 #  CARLA BRIDGE  -  OBSTACLES  (the stalled cars placed along the route)
@@ -216,7 +276,7 @@ CARLA_OBSTACLES = [
 #    "chase"   : behind-and-above, looking forward (driver-ish view).
 #    "front"   : ahead of the car, looking back at it (cinematic).
 # ============================================================================ #
-CARLA_CAMERA_MODE = "topdown"     # "topdown" | "chase" | "front"
+CARLA_CAMERA_MODE = "chase"     # "topdown" | "chase" | "front"
 
 # "topdown" preset
 CARLA_CAM_TOPDOWN_HEIGHT = 40.0   # height above the car. units m. RANGE 15..80.
@@ -239,6 +299,15 @@ CARLA_MAX_BRAKE_DEC    = 6.0   # deceleration that maps to brake = 1.0.
 CARLA_OBSTACLE_RADIUS  = 1.5   # radius assigned to ground-truth detected vehicles
                                # (used only with --no-lidar).
                                # units m. RANGE 1.0..2.5.
+CARLA_SOLVE_HOLD_TICKS = 3     # if an MPC solve fails (returns no trajectory),
+                               # hold the LAST GOOD command for up to this many
+                               # ticks instead of emergency-braking. A failed
+                               # solve is almost always a transient low-speed,
+                               # off-path recovery; braking there removes the
+                               # speed the controller needs to steer back and
+                               # stalls the car. Holding lets it keep moving so
+                               # the next solve recovers. RANGE 0..6. 0 restores
+                               # the old brake-immediately behaviour.
 
 # ============================================================================ #
 #  CARLA BRIDGE  -  adaptive speed (SEPARATE from the pygame ADAPT_* values,
@@ -306,9 +375,43 @@ CARLA_BUMPER_GUARD_BACK   = -8.0  # how far BEHIND the car (negative x) an obsta
                                   # is still remembered. units m. RANGE -12..-4.
 CARLA_BUMPER_GUARD_FRONT  = 2.0   # how far AHEAD of the CG the guard zone extends.
                                   # units m. RANGE 1..4.
-CARLA_BUMPER_GUARD_LATERAL= 6.0   # lateral half-width of the memory zone.
+CARLA_BUMPER_GUARD_LATERAL= 3.0   # lateral half-width of the memory zone.
                                   # units m. RANGE 3..8. Wider = holds an obstacle
                                   # longer through a swerve.
-CARLA_PATH_FILTER_MARGIN  = 2.5   # an obstacle is kept if it comes within
+CARLA_PATH_FILTER_MARGIN  = 0.2   # an obstacle is kept if it comes within
                                   # (its radius + this) of the planned path.
                                   # units m. RANGE 1.0..4.0. Larger = more cautious.
+
+# ============================================================================ #
+#  CARLA BRIDGE  -  OBSTACLE TRACKER (Kalman multi-object tracker)
+#  Stabilises the raw per-tick LiDAR detections: gives each obstacle a steady
+#  identity, a smoothed position, an estimated velocity, and brief coasting
+#  through dropouts. Perception-only - it feeds the SAME (x,y,r,vx,vy) tuples
+#  the existing obstacle filter already uses, so avoidance behaviour is
+#  unchanged; the obstacle list is just cleaner and less jittery.
+# ============================================================================ #
+CARLA_TRACKER_ENABLE  = True   # master switch. True = stabilised tracked
+                               # obstacles, False = raw per-tick detections
+                               # (exact previous behaviour). Set False to A/B.
+CARLA_TRACKER_GATE    = 3.0    # max distance to match a detection to an existing
+                               # track. units m. RANGE 1.5..6.0. Too small = a
+                               # track splits when an obstacle jumps; too big =
+                               # two nearby obstacles merge into one.
+CARLA_TRACKER_Q_ACCEL = 4.0    # process-noise accel variance. RANGE 0.5..10.0.
+                               # Higher = trusts measurements more (agile but
+                               # noisier); lower = smoother but laggier.
+CARLA_TRACKER_MEAS_VAR= 0.25   # measurement-noise variance. RANGE 0.05..1.0.
+                               # Higher = smoother but laggier position.
+CARLA_TRACKER_CONFIRM = 2      # a track must be seen this many ticks before it
+                               # is output. RANGE 1..5. Higher rejects one-frame
+                               # noise but adds a tick or two of latency.
+CARLA_TRACKER_MAX_MISS= 15     # a track coasts this many ticks of no detection
+                               # before being dropped. RANGE 2..25. In CARLA's
+                               # synchronous mode each tick is exactly DT of sim
+                               # time, so 15 ticks ~= 1.5 s of coasting - long
+                               # enough to hold an obstacle through the brief
+                               # occlusion while passing it, so its identity (and
+                               # the planner's committed pass side) survives
+                               # instead of being dropped and re-decided on a
+                               # late, close re-acquire. Higher holds a vanished
+                               # obstacle longer.
